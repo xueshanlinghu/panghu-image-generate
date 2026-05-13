@@ -389,6 +389,7 @@ textarea:disabled {
 }
 
 .canvas-stage.is-loading {
+  height: 100%;
   aspect-ratio: auto !important;
 }
 

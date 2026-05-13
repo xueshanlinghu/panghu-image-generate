@@ -80,6 +80,26 @@ SESSION_SECRET=一段足够长的随机字符串
 API_PORT=8787
 ```
 
+### Docker Compose（推荐）
+
+```bash
+docker compose up -d
+```
+
+查看日志：
+
+```bash
+docker compose logs -f
+```
+
+停止并删除容器：
+
+```bash
+docker compose down
+```
+
+### Docker 命令
+
 构建镜像：
 
 ```bash
@@ -98,18 +118,6 @@ docker run -d \
   panghu-image-web
 ```
 
-Docker 模式下前端由后端服务直接托管，访问：
-
-```text
-http://localhost:8787
-```
-
-管理员后台：
-
-```text
-http://localhost:8787/admin
-```
-
 查看日志：
 
 ```bash
@@ -120,6 +128,20 @@ docker logs -f panghu-image-web
 
 ```bash
 docker rm -f panghu-image-web
+```
+
+### 访问地址
+
+Docker 模式下前端由后端服务直接托管：
+
+```text
+http://localhost:8787
+```
+
+管理员后台：
+
+```text
+http://localhost:8787/admin
 ```
 
 `data/` 目录会保存 SQLite 数据库和本地缓存图片，`logs/` 目录会保存服务日志。部署时建议始终挂载这两个目录，避免容器重建后数据丢失。

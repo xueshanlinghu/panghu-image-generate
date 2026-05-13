@@ -234,7 +234,7 @@ function render() {
                 `
                 : item
                   ? `
-                    <img src="${escapeHtml(item.imageUrl)}" alt="${escapeHtml(item.prompt)}" />
+                    <img src="${escapeHtml(item.imageUrl)}" alt="${escapeHtml(item.prompt)}" data-action="fullscreen" />
                   `
                   : `<div class="empty-state"><i data-lucide="image-plus"></i><strong>暂无图片</strong><span>输入提示词，创造属于你的图片</span></div>`
             }
@@ -249,10 +249,6 @@ function render() {
             placeholder="输入你的图片描述，文本绘制用中文双引号 “” 包裹"
           >${escapeHtml(state.prompt)}</textarea>
           <div class="prompt-actions">
-            <button type="button" class="tool-button" data-action="prompt-polish" title="提示词润色" ${state.mode === "edit" ? "disabled" : ""}>
-              <i data-lucide="wand-2"></i>
-              <span>润色</span>
-            </button>
             <button type="submit" class="send-button" ${state.isGenerating || state.mode === "edit" ? "disabled" : ""} aria-label="生成图片">
               <i data-lucide="send"></i>
             </button>
@@ -428,11 +424,6 @@ function bindEvents() {
         state.prompt = "";
         render();
       }
-      if (action === "prompt-polish") {
-        const prefix = "高质量、细节丰富、柔和自然光、干净构图，";
-        state.prompt = state.prompt.startsWith(prefix) ? state.prompt : `${prefix}${state.prompt}`.trim();
-        render();
-      }
       if (action === "close-edit-notice") {
         state.showEditNotice = false;
         state.mode = "generate";
@@ -445,8 +436,19 @@ function bindEvents() {
       if (action === "download-selected") {
         downloadSelectedImage();
       }
+      if (action === "fullscreen") {
+        openFullscreen(button.src);
+      }
     });
   });
+}
+
+function openFullscreen(src) {
+  const overlay = document.createElement("div");
+  overlay.className = "fullscreen-overlay";
+  overlay.innerHTML = `<img src="${src}" />`;
+  overlay.addEventListener("click", () => overlay.remove());
+  document.body.appendChild(overlay);
 }
 
 async function downloadSelectedImage() {

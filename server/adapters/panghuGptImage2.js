@@ -1,3 +1,5 @@
+import fs from "node:fs";
+
 const adapterId = "panghu:gpt-image-2";
 
 export const panghuGptImage2Adapter = {
@@ -18,7 +20,15 @@ export const panghuGptImage2Adapter = {
     }
   },
 
-  buildRequest(input) {
+  async buildRequest(input) {
+    // 同一个模型同时承接文生图和图生图，只在这里分流上游请求形态。
+    if (input.mode === "edit") {
+      return this.buildEditRequest(input);
+    }
+    return this.buildGenerationRequest(input);
+  },
+
+  buildGenerationRequest(input) {
     const body = {
       model: this.model,
       prompt: input.prompt.trim(),
@@ -36,6 +46,32 @@ export const panghuGptImage2Adapter = {
           Authorization: `Bearer ${process.env.PANGHU_API_KEY}`,
         },
         body: JSON.stringify(body),
+      },
+    };
+  },
+
+  async buildEditRequest(input) {
+    const body = new FormData();
+    body.append("model", this.model);
+    body.append("prompt", input.prompt.trim());
+
+    if (input.size && input.size !== "auto") body.append("size", input.size);
+    if (input.quality && input.quality !== "auto") body.append("quality", input.quality);
+
+    for (const file of input.files || []) {
+      const bytes = await fs.promises.readFile(file.absolutePath);
+      const blob = new Blob([bytes], { type: file.mimeType || "application/octet-stream" });
+      body.append("image", blob, file.originalName || file.fileName || "image.png");
+    }
+
+    return {
+      url: `${process.env.PANGHU_API_BASE_URL.replace(/\/$/, "")}/v1/images/edits`,
+      options: {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${process.env.PANGHU_API_KEY}`,
+        },
+        body,
       },
     };
   },

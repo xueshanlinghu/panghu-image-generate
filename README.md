@@ -1,6 +1,6 @@
 # 胖狐生图
 
-胖狐生图是一个 AI 图像生成工作台。当前版本支持通过胖狐 API 的 `gpt-image-2` 模型生成图片，并提供图片预览、历史记录和原图下载功能。
+胖狐生图是一个 AI 图像生成工作台。当前版本支持通过胖狐 API 的 `gpt-image-2` 模型进行文生图与图生图，并提供图片预览、历史记录、单张删除和原图下载功能。
 
 ## 使用前准备
 
@@ -78,6 +78,7 @@ ADMIN_USERNAME=管理员账号
 ADMIN_PASSWORD=管理员密码
 SESSION_SECRET=一段足够长的随机字符串
 API_PORT=8787
+JOB_WORKER_CONCURRENCY=2
 ```
 
 ### Docker Compose（推荐）

@@ -1,6 +1,8 @@
 import "dotenv/config";
 import express from "express";
+import multer from "multer";
 import fs from "node:fs/promises";
+import syncFs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomBytes, scrypt as scryptCallback, timingSafeEqual, createHash } from "node:crypto";
@@ -14,15 +16,25 @@ const __dirname = path.dirname(__filename);
 
 const app = express();
 const port = Number(process.env.PORT || process.env.API_PORT || 8787);
+const workerConcurrency = Math.max(1, Number(process.env.JOB_WORKER_CONCURRENCY || 2));
+const jobRetryDelayMs = 10_000;
+const jobMaxAttempts = 3;
+const upstreamTimeoutMs = 1000 * 60 * 8;
+const maxEditImages = 6;
+const maxUploadBytes = 10 * 1024 * 1024;
 const dataDir = path.join(__dirname, "data");
 const dbFile = path.join(dataDir, "panghu.sqlite");
 const generatedImagesDir = path.join(dataDir, "generated-images");
+const jobInputsDir = path.join(dataDir, "job-inputs");
 const logsDir = path.join(__dirname, "logs");
 const serverLogFile = path.join(logsDir, "server.log");
 const sessionCookie = "panghu_session";
 const sessionMaxAgeMs = 1000 * 60 * 60 * 24 * 7;
 
 await fs.mkdir(dataDir, { recursive: true });
+await fs.mkdir(generatedImagesDir, { recursive: true });
+await fs.mkdir(jobInputsDir, { recursive: true });
+
 const db = new DatabaseSync(dbFile);
 db.exec("PRAGMA journal_mode = WAL;");
 db.exec("PRAGMA foreign_keys = ON;");
@@ -31,6 +43,14 @@ app.use(express.json({ limit: "2mb" }));
 
 function nowIso() {
   return new Date().toISOString();
+}
+
+function isoAfter(ms) {
+  return new Date(Date.now() + ms).toISOString();
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function logServer(event, details = {}) {
@@ -91,6 +111,7 @@ function initDb() {
       status TEXT NOT NULL,
       usage_json TEXT,
       raw_json TEXT,
+      request_json TEXT,
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
     );
 
@@ -100,6 +121,7 @@ function initDb() {
       username TEXT,
       display_name TEXT,
       created_at TEXT NOT NULL,
+      updated_at TEXT,
       provider_id TEXT,
       model TEXT,
       prompt TEXT,
@@ -109,16 +131,34 @@ function initDb() {
       mode TEXT,
       status TEXT NOT NULL,
       generation_id TEXT,
+      job_id TEXT,
       error_message TEXT,
       duration_ms INTEGER,
+      attempt_count INTEGER NOT NULL DEFAULT 0,
       params_json TEXT,
+      image_url TEXT,
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL
     );
 
-    CREATE TABLE IF NOT EXISTS app_settings (
-      key TEXT PRIMARY KEY,
-      value TEXT NOT NULL,
-      updated_at TEXT NOT NULL
+    CREATE TABLE IF NOT EXISTS generation_jobs (
+      id TEXT PRIMARY KEY,
+      user_id INTEGER NOT NULL,
+      type TEXT NOT NULL CHECK (type IN ('generate', 'edit')),
+      status TEXT NOT NULL CHECK (status IN ('queued', 'processing', 'retrying', 'done', 'failed')),
+      request_json TEXT NOT NULL,
+      input_files_json TEXT,
+      generation_id TEXT,
+      log_id INTEGER,
+      attempt_count INTEGER NOT NULL DEFAULT 0,
+      last_error TEXT,
+      created_at TEXT NOT NULL,
+      started_at TEXT,
+      updated_at TEXT NOT NULL,
+      finished_at TEXT,
+      available_at TEXT NOT NULL,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+      FOREIGN KEY (generation_id) REFERENCES generations(id) ON DELETE SET NULL,
+      FOREIGN KEY (log_id) REFERENCES generation_logs(id) ON DELETE SET NULL
     );
 
     CREATE INDEX IF NOT EXISTS idx_sessions_token_hash ON sessions(token_hash);
@@ -126,10 +166,34 @@ function initDb() {
     CREATE INDEX IF NOT EXISTS idx_generations_user_created ON generations(user_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_generation_logs_created ON generation_logs(created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_generation_logs_user_created ON generation_logs(user_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_generation_jobs_user_created ON generation_jobs(user_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_generation_jobs_status_available ON generation_jobs(status, available_at, created_at);
   `);
 }
 
+function getTableColumns(tableName) {
+  return db.prepare(`PRAGMA table_info(${tableName})`).all().map((row) => row.name);
+}
+
+function ensureColumn(tableName, columnName, definition) {
+  const columns = new Set(getTableColumns(tableName));
+  if (!columns.has(columnName)) {
+    db.exec(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${definition}`);
+  }
+}
+
+function runMigrations() {
+  // 兼容已有 SQLite 数据库，避免因为新增字段导致老环境启动失败。
+  ensureColumn("generations", "request_json", "TEXT");
+  ensureColumn("generation_logs", "updated_at", "TEXT");
+  ensureColumn("generation_logs", "job_id", "TEXT");
+  ensureColumn("generation_logs", "attempt_count", "INTEGER NOT NULL DEFAULT 0");
+  ensureColumn("generation_logs", "image_url", "TEXT");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_generation_logs_job_id ON generation_logs(job_id)");
+}
+
 initDb();
+runMigrations();
 
 function parseCookies(header = "") {
   return Object.fromEntries(
@@ -198,12 +262,29 @@ function sanitizeUser(row) {
   };
 }
 
+function parseJsonValue(value, fallback = null) {
+  if (!value) return fallback;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return fallback;
+  }
+}
+
 function userImageFolderName(username) {
   return String(username || "unknown").replace(/[^a-zA-Z0-9_.-]/g, "_");
 }
 
 function userImageDir(username) {
   return path.join(generatedImagesDir, userImageFolderName(username));
+}
+
+function jobInputDir(jobId) {
+  return path.join(jobInputsDir, jobId);
+}
+
+function absoluteStoredPath(storedPath) {
+  return storedPath ? path.join(__dirname, storedPath) : null;
 }
 
 async function clearUserImageDir(username) {
@@ -284,7 +365,8 @@ function generationFromRow(row) {
     storedImagePath: row.stored_image_path,
     imageContentType: row.image_content_type,
     status: row.status,
-    usage: row.usage_json ? JSON.parse(row.usage_json) : null,
+    usage: parseJsonValue(row.usage_json),
+    request: parseJsonValue(row.request_json, {}),
   };
 }
 
@@ -293,8 +375,8 @@ function saveGeneration(record) {
     INSERT INTO generations (
       id, user_id, created_at, provider_id, adapter_id, model, prompt, revised_prompt,
       size, quality, count, mode, image_url, original_image_url, stored_image_path,
-      image_content_type, status, usage_json, raw_json
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      image_content_type, status, usage_json, raw_json, request_json
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     record.id,
     record.userId,
@@ -315,21 +397,24 @@ function saveGeneration(record) {
     record.status,
     JSON.stringify(record.usage || null),
     JSON.stringify(record.raw || null),
+    JSON.stringify(record.request || null),
   );
 }
 
-function writeGenerationLog({ user, request, status, generationId = null, errorMessage = null, startedAt }) {
-  const duration = Number.isFinite(startedAt) ? Date.now() - startedAt : null;
-  db.prepare(`
+function createGenerationLog({ user, request, status, jobId, attemptCount = 0, errorMessage = null, imageUrl = null }) {
+  const createdAt = nowIso();
+  const result = db.prepare(`
     INSERT INTO generation_logs (
-      user_id, username, display_name, created_at, provider_id, model, prompt,
-      size, quality, count, mode, status, generation_id, error_message, duration_ms, params_json
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      user_id, username, display_name, created_at, updated_at, provider_id, model, prompt,
+      size, quality, count, mode, status, generation_id, job_id, error_message, duration_ms,
+      attempt_count, params_json, image_url
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     user?.id || null,
     user?.username || null,
     user?.display_name || null,
-    nowIso(),
+    createdAt,
+    createdAt,
     request?.providerId || null,
     request?.model || null,
     request?.prompt || null,
@@ -338,17 +423,33 @@ function writeGenerationLog({ user, request, status, generationId = null, errorM
     Number(request?.count || 1),
     request?.mode || null,
     status,
-    generationId,
+    null,
+    jobId,
     errorMessage,
-    duration,
-    JSON.stringify({
-      providerId: request?.providerId,
-      model: request?.model,
-      size: request?.size,
-      quality: request?.quality,
-      count: Number(request?.count || 1),
-      mode: request?.mode,
-    }),
+    null,
+    attemptCount,
+    JSON.stringify(request || null),
+    imageUrl,
+  );
+  return Number(result.lastInsertRowid);
+}
+
+function updateGenerationLog(logId, patch = {}) {
+  const existing = db.prepare("SELECT * FROM generation_logs WHERE id = ?").get(logId);
+  if (!existing) return;
+  db.prepare(`
+    UPDATE generation_logs
+    SET status = ?, generation_id = ?, error_message = ?, duration_ms = ?, updated_at = ?, attempt_count = ?, image_url = ?
+    WHERE id = ?
+  `).run(
+    patch.status ?? existing.status,
+    patch.generationId ?? existing.generation_id,
+    patch.errorMessage ?? existing.error_message,
+    patch.durationMs ?? existing.duration_ms,
+    nowIso(),
+    patch.attemptCount ?? existing.attempt_count,
+    patch.imageUrl ?? existing.image_url,
+    logId,
   );
 }
 
@@ -382,30 +483,89 @@ async function cacheGeneratedImage(id, imageUrl, username) {
   };
 }
 
-async function moveGenerationImagesToUser(generationRows, targetUsername) {
-  const targetFolder = userImageFolderName(targetUsername);
-  const targetDir = userImageDir(targetUsername);
+async function safeMoveFile(fromPath, toPath) {
+  if (fromPath === toPath) return;
+  await fs.mkdir(path.dirname(toPath), { recursive: true });
+  try {
+    await fs.rename(fromPath, toPath);
+  } catch (error) {
+    if (error?.code === "EXDEV" || error?.code === "EPERM" || error?.code === "EACCES") {
+      await fs.copyFile(fromPath, toPath);
+      await fs.unlink(fromPath).catch(() => null);
+      return;
+    }
+    throw error;
+  }
+}
+
+async function deleteFileIfExists(filePath) {
+  if (!filePath) return;
+  await fs.rm(filePath, { force: true }).catch(() => null);
+}
+
+async function cleanupJobInputFiles(job) {
+  const files = parseJsonValue(job.input_files_json, []);
+  await Promise.all(files.map((file) => deleteFileIfExists(file.absolutePath)));
+  await fs.rm(jobInputDir(job.id), { recursive: true, force: true }).catch(() => null);
+}
+
+async function moveGenerationImagesToUser(generationRows, targetUser) {
+  const targetFolder = userImageFolderName(targetUser.username);
+  const targetDir = userImageDir(targetUser.username);
   await fs.mkdir(targetDir, { recursive: true });
 
+  const movedFiles = [];
+  const updates = [];
+
   for (const row of generationRows) {
-    const currentPath = row.stored_image_path ? path.join(__dirname, row.stored_image_path) : null;
-    const imageUrlPath = row.image_url?.startsWith("/api/generated-images/") ? row.image_url.replace("/api/generated-images/", "") : "";
-    const filename = path.basename(currentPath || imageUrlPath || `${row.id}.png`);
+    const currentPath = absoluteStoredPath(row.stored_image_path);
+    const fallbackFilename = `${row.id}.png`;
+    const filename = path.basename(currentPath || row.stored_image_path || fallbackFilename);
     const nextRelativePath = `data/generated-images/${targetFolder}/${filename}`;
     const nextApiUrl = `/api/generated-images/${targetFolder}/${filename}`;
     const nextPath = path.join(__dirname, nextRelativePath);
 
-    try {
-      if (currentPath && currentPath !== nextPath) {
-        await fs.mkdir(path.dirname(nextPath), { recursive: true });
-        await fs.rm(nextPath, { force: true });
-        await fs.rename(currentPath, nextPath);
+    if (currentPath && syncFs.existsSync(currentPath)) {
+      if (currentPath !== nextPath) {
+        await safeMoveFile(currentPath, nextPath);
+        movedFiles.push({ fromPath: currentPath, toPath: nextPath });
       }
-    } catch (error) {
-      if (error?.code !== "ENOENT") throw error;
+    } else if (row.stored_image_path) {
+      await logServer("generation.transfer_missing_source", {
+        generationId: row.id,
+        storedImagePath: row.stored_image_path,
+      });
     }
 
-    db.prepare("UPDATE generations SET image_url = ?, stored_image_path = ? WHERE id = ?").run(nextApiUrl, nextRelativePath, row.id);
+    updates.push({ id: row.id, nextApiUrl, nextRelativePath });
+  }
+
+  db.exec("BEGIN");
+  try {
+    for (const update of updates) {
+      db.prepare("UPDATE generations SET image_url = ?, stored_image_path = ?, user_id = ? WHERE id = ?").run(
+        update.nextApiUrl,
+        update.nextRelativePath,
+        targetUser.id,
+        update.id,
+      );
+    }
+    db.prepare("UPDATE generation_logs SET user_id = ?, username = ?, display_name = ? WHERE user_id = ?").run(
+      targetUser.id,
+      targetUser.username,
+      targetUser.display_name,
+      generationRows[0]?.user_id || null,
+    );
+    db.exec("COMMIT");
+  } catch (error) {
+    db.exec("ROLLBACK");
+    await Promise.all(
+      movedFiles
+        .slice()
+        .reverse()
+        .map(({ fromPath, toPath }) => safeMoveFile(toPath, fromPath).catch(() => null)),
+    );
+    throw error;
   }
 }
 
@@ -425,8 +585,468 @@ function validateUserPayload(body, { requirePassword = true } = {}) {
   return { username, displayName, password, quotaRemaining: quota };
 }
 
+function validateRequestShape(body = {}, { requireImages = false } = {}) {
+  const providerId = String(body.providerId || "panghu");
+  const model = String(body.model || "gpt-image-2");
+  const prompt = String(body.prompt || "").trim();
+  const size = String(body.size || "auto");
+  const quality = String(body.quality || "auto");
+  const count = Math.max(1, Number(body.count || 1));
+  const mode = requireImages ? "edit" : String(body.mode || "generate");
+
+  if (!model || !prompt) return { error: "Model and prompt are required." };
+  if (prompt.length < 1 || prompt.length > 32000) {
+    return { error: "提示词长度需在 1 到 32000 个字符之间。" };
+  }
+  if (count !== 1) return { error: "当前仅支持单张输出。" };
+
+  return {
+    providerId,
+    model,
+    prompt,
+    size,
+    quality,
+    count,
+    mode,
+  };
+}
+
+function createJobId(prefix = "job") {
+  return `${prefix}_${Date.now()}_${randomBytes(4).toString("hex")}`;
+}
+
+function isTransientJobError(error) {
+  if (!error) return false;
+  if (error.transient === true) return true;
+  if (error.statusCode && Number(error.statusCode) >= 500) return true;
+  return ["AbortError", "TypeError"].includes(error.name);
+}
+
+function makeJobError(message, { statusCode = 502, transient = false } = {}) {
+  const error = new Error(message);
+  error.statusCode = statusCode;
+  error.transient = transient;
+  return error;
+}
+
+function loadJob(jobId) {
+  return db.prepare("SELECT * FROM generation_jobs WHERE id = ?").get(jobId);
+}
+
+function enqueueJob({ user, type, request, inputFiles = [] }) {
+  const createdAt = nowIso();
+  const jobId = inputFiles[0]?.jobId || createJobId("job");
+  const logId = createGenerationLog({ user, request, status: "queued", jobId, attemptCount: 0 });
+
+  db.exec("BEGIN");
+  try {
+    // 任务提交即先扣配额，只有最终失败才退还，避免用户连续重复点击超发请求。
+    const quotaResult = db
+      .prepare("UPDATE users SET quota_remaining = quota_remaining - 1, updated_at = ? WHERE id = ? AND quota_remaining > 0")
+      .run(createdAt, user.id);
+    if (!quotaResult.changes) {
+      throw new Error("可用生图次数不足，请联系管理员增加次数。");
+    }
+    db.prepare(`
+      INSERT INTO generation_jobs (
+        id, user_id, type, status, request_json, input_files_json, generation_id, log_id, attempt_count,
+        last_error, created_at, started_at, updated_at, finished_at, available_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      jobId,
+      user.id,
+      type,
+      "queued",
+      JSON.stringify(request),
+      JSON.stringify(inputFiles),
+      null,
+      logId,
+      0,
+      null,
+      createdAt,
+      null,
+      createdAt,
+      null,
+      createdAt,
+    );
+    db.exec("COMMIT");
+  } catch (error) {
+    db.exec("ROLLBACK");
+    db.prepare("DELETE FROM generation_logs WHERE id = ?").run(logId);
+    throw error;
+  }
+
+  return { jobId, logId };
+}
+
+function claimNextJob() {
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    // 单进程下通过 SQLite 锁来串行领取任务，后续即使并发 worker 增加也不会重复消费同一条任务。
+    const job = db.prepare(`
+      SELECT * FROM generation_jobs
+      WHERE status IN ('queued', 'retrying')
+        AND available_at <= ?
+      ORDER BY created_at ASC
+      LIMIT 1
+    `).get(nowIso());
+
+    if (!job) {
+      db.exec("COMMIT");
+      return null;
+    }
+
+    const startedAt = job.started_at || nowIso();
+    db.prepare(`
+      UPDATE generation_jobs
+      SET status = 'processing',
+          attempt_count = attempt_count + 1,
+          started_at = ?,
+          updated_at = ?,
+          last_error = NULL
+      WHERE id = ?
+    `).run(startedAt, nowIso(), job.id);
+
+    db.exec("COMMIT");
+    return loadJob(job.id);
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
+}
+
+function finalizeFailedJob(job, errorMessage) {
+  db.exec("BEGIN");
+  try {
+    db.prepare(`
+      UPDATE generation_jobs
+      SET status = 'failed',
+          last_error = ?,
+          updated_at = ?,
+          finished_at = ?
+      WHERE id = ?
+    `).run(errorMessage, nowIso(), nowIso(), job.id);
+    db.prepare("UPDATE users SET quota_remaining = quota_remaining + 1, updated_at = ? WHERE id = ?").run(nowIso(), job.user_id);
+    db.exec("COMMIT");
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
+}
+
+function finalizeSucceededJob(jobId, generationId) {
+  db.prepare(`
+    UPDATE generation_jobs
+    SET status = 'done',
+        generation_id = ?,
+        updated_at = ?,
+        finished_at = ?
+    WHERE id = ?
+  `).run(generationId, nowIso(), nowIso(), jobId);
+}
+
+async function fetchWithTimeout(url, options = {}) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), upstreamTimeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function callProvider(job, request, adapter, user) {
+  const inputFiles = parseJsonValue(job.input_files_json, []);
+  const upstreamRequest = await adapter.buildRequest({ ...request, userId: user.id, files: inputFiles });
+  await logServer("generation.upstream_start", { adapterId: adapter.id, jobId: job.id, type: job.type });
+  const upstream = await fetchWithTimeout(upstreamRequest.url, upstreamRequest.options);
+  await logServer("generation.upstream_response", { adapterId: adapter.id, status: upstream.status, jobId: job.id });
+
+  const text = await upstream.text();
+  let payload;
+  try {
+    payload = text ? JSON.parse(text) : {};
+  } catch {
+    payload = { raw: text };
+  }
+
+  if (!upstream.ok) {
+    const message = payload?.error?.message || payload?.error || "Image generation failed.";
+    throw makeJobError(message, { statusCode: upstream.status, transient: upstream.status >= 500 });
+  }
+
+  const parsed = adapter.parseResponse(payload);
+  if (!parsed?.imageUrl && !parsed?.originalImageUrl) {
+    throw makeJobError("上游返回了无效的图片结果。", { transient: true });
+  }
+
+  return parsed;
+}
+
+async function executeJob(job) {
+  const request = parseJsonValue(job.request_json, {});
+  const user = db.prepare("SELECT * FROM users WHERE id = ?").get(job.user_id);
+  if (!user || !user.is_enabled) {
+    throw makeJobError("用户不存在或已被禁用。", { statusCode: 400 });
+  }
+
+  const adapter = getGenerationAdapter(request.providerId, request.model);
+  if (!adapter) {
+    throw makeJobError("Unsupported provider/model combination.", { statusCode: 400 });
+  }
+
+  adapter.assertConfigured();
+  const parsed = await callProvider(job, request, adapter, user);
+  const generationId = `gen_${Date.now()}_${randomBytes(3).toString("hex")}`;
+
+  let cachedImage = null;
+  try {
+    cachedImage = await cacheGeneratedImage(generationId, parsed.originalImageUrl, user.username);
+  } catch {
+    cachedImage = null;
+  }
+
+  const inputFiles = parseJsonValue(job.input_files_json, []);
+  const requestRecord = {
+    ...request,
+    // 历史里保留输入图摘要，便于后台排查具体用了哪些参考图。
+    inputImages: inputFiles.map((file) => ({
+      originalName: file.originalName,
+      mimeType: file.mimeType,
+      size: file.size,
+    })),
+  };
+
+  const record = {
+    id: generationId,
+    userId: user.id,
+    createdAt: nowIso(),
+    providerId: request.providerId,
+    adapterId: adapter.id,
+    model: parsed.model,
+    prompt: request.prompt,
+    revisedPrompt: parsed.revisedPrompt,
+    size: request.size,
+    quality: request.quality,
+    count: request.count,
+    mode: request.mode,
+    imageUrl: cachedImage?.storedImageUrl || parsed.imageUrl,
+    originalImageUrl: parsed.originalImageUrl,
+    storedImagePath: cachedImage?.storedImagePath || null,
+    imageContentType: cachedImage?.contentType || null,
+    status: "done",
+    usage: parsed.usage,
+    raw: parsed.raw,
+    request: requestRecord,
+  };
+
+  saveGeneration(record);
+  finalizeSucceededJob(job.id, record.id);
+  updateGenerationLog(job.log_id, {
+    status: "success",
+    generationId: record.id,
+    errorMessage: null,
+    durationMs: Date.now() - new Date(job.created_at).getTime(),
+    attemptCount: job.attempt_count,
+    imageUrl: record.imageUrl,
+  });
+  await cleanupJobInputFiles(job);
+
+  await logServer("generation.success", {
+    id: record.id,
+    jobId: job.id,
+    adapterId: adapter.id,
+    storedImage: Boolean(record.storedImagePath),
+    hasOriginalUrl: Boolean(record.originalImageUrl),
+  });
+}
+
+async function handleJobFailure(job, error) {
+  const transient = isTransientJobError(error);
+  const message = error?.message || "Unable to call image provider.";
+  const latestJob = loadJob(job.id);
+  const currentAttempts = latestJob?.attempt_count || job.attempt_count || 1;
+
+  if (transient && currentAttempts < jobMaxAttempts) {
+    // 只对瞬时错误重试，避免把参数错误或鉴权错误反复打给上游。
+    db.prepare(`
+      UPDATE generation_jobs
+      SET status = 'retrying',
+          last_error = ?,
+          updated_at = ?,
+          available_at = ?
+      WHERE id = ?
+    `).run(message, nowIso(), isoAfter(jobRetryDelayMs), job.id);
+    updateGenerationLog(job.log_id, {
+      status: "retrying",
+      errorMessage: message,
+      attemptCount: currentAttempts,
+      durationMs: Date.now() - new Date(job.created_at).getTime(),
+    });
+    setTimeout(() => void scheduleWorkers(), jobRetryDelayMs + 50);
+    return;
+  }
+
+  finalizeFailedJob(job, message);
+  updateGenerationLog(job.log_id, {
+    status: "failed",
+    errorMessage: message,
+    attemptCount: currentAttempts,
+    durationMs: Date.now() - new Date(job.created_at).getTime(),
+  });
+  await cleanupJobInputFiles(job);
+  await logServer("generation.failed", {
+    providerId: parseJsonValue(job.request_json, {})?.providerId,
+    model: parseJsonValue(job.request_json, {})?.model,
+    jobId: job.id,
+    error: message,
+  });
+}
+
+let runningJobs = 0;
+let workerLoopScheduled = false;
+
+async function runWorkerLoop() {
+  workerLoopScheduled = false;
+  while (runningJobs < workerConcurrency) {
+    const job = claimNextJob();
+    if (!job) break;
+
+    runningJobs += 1;
+    updateGenerationLog(job.log_id, {
+      status: "processing",
+      attemptCount: job.attempt_count,
+      durationMs: Date.now() - new Date(job.created_at).getTime(),
+    });
+
+    void (async () => {
+      try {
+        await executeJob(job);
+      } catch (error) {
+        await handleJobFailure(job, error);
+      } finally {
+        runningJobs -= 1;
+        void scheduleWorkers();
+      }
+    })();
+  }
+}
+
+async function scheduleWorkers() {
+  if (workerLoopScheduled) return;
+  workerLoopScheduled = true;
+  queueMicrotask(() => {
+    void runWorkerLoop();
+  });
+}
+
+function getJobResult(job) {
+  if (!job?.generation_id) return null;
+  const generation = db.prepare("SELECT * FROM generations WHERE id = ?").get(job.generation_id);
+  return generation ? generationFromRow(generation) : null;
+}
+
+function jobResponse(job) {
+  return {
+    jobId: job.id,
+    status: job.status,
+    attemptCount: job.attempt_count,
+    error: job.last_error || null,
+    createdAt: job.created_at,
+    updatedAt: job.updated_at,
+    finishedAt: job.finished_at,
+    result: job.status === "done" ? getJobResult(job) : null,
+  };
+}
+
+async function recoverIncompleteJobs() {
+  // 服务重启后，把卡在处理中/重试中的任务重新放回队列继续跑。
+  db.prepare(`
+    UPDATE generation_jobs
+    SET status = 'queued',
+        updated_at = ?,
+        available_at = ?,
+        last_error = COALESCE(last_error, '服务重启后自动恢复任务。')
+    WHERE status IN ('processing', 'retrying')
+  `).run(nowIso(), nowIso());
+}
+
+async function repairStoredGenerationFiles() {
+  const rows = db.prepare(`
+    SELECT g.id, g.user_id, g.image_url, g.stored_image_path, u.username
+    FROM generations g
+    JOIN users u ON u.id = g.user_id
+    WHERE g.stored_image_path IS NOT NULL AND g.stored_image_path != ''
+  `).all();
+
+  for (const row of rows) {
+    // 修复“数据库归属已经变了，但图片还躺在旧用户目录”的历史脏数据。
+    const expectedFolder = userImageFolderName(row.username);
+    const expectedFilename = path.basename(row.stored_image_path);
+    const expectedRelativePath = `data/generated-images/${expectedFolder}/${expectedFilename}`;
+    const expectedApiUrl = `/api/generated-images/${expectedFolder}/${expectedFilename}`;
+    const currentPath = absoluteStoredPath(row.stored_image_path);
+    const expectedPath = path.join(__dirname, expectedRelativePath);
+    const folderMismatch = !row.stored_image_path.includes(`/generated-images/${expectedFolder}/`) && !row.stored_image_path.includes(`\\generated-images\\${expectedFolder}\\`);
+
+    if (!folderMismatch && syncFs.existsSync(expectedPath)) continue;
+    if (!currentPath || !syncFs.existsSync(currentPath)) continue;
+
+    try {
+      await safeMoveFile(currentPath, expectedPath);
+      db.prepare("UPDATE generations SET stored_image_path = ?, image_url = ? WHERE id = ?").run(
+        expectedRelativePath,
+        expectedApiUrl,
+        row.id,
+      );
+      await logServer("generation.repaired_image_path", {
+        generationId: row.id,
+        userId: row.user_id,
+        fromPath: row.stored_image_path,
+        toPath: expectedRelativePath,
+      });
+    } catch (error) {
+      await logServer("generation.repair_failed", {
+        generationId: row.id,
+        error: error?.message || "repair failed",
+      });
+    }
+  }
+}
+
+function prepareEditUpload(req, res, next) {
+  req.pendingUploadId = createJobId("job");
+  next();
+}
+
+const upload = multer({
+  storage: multer.diskStorage({
+    destination(req, file, cb) {
+      const dir = jobInputDir(req.pendingUploadId || createJobId("job"));
+      req.pendingUploadId = path.basename(dir);
+      syncFs.mkdirSync(dir, { recursive: true });
+      cb(null, dir);
+    },
+    filename(req, file, cb) {
+      const safeName = path.basename(file.originalname).replace(/[^a-zA-Z0-9_.-]/g, "_");
+      cb(null, `${Date.now()}-${randomBytes(3).toString("hex")}-${safeName}`);
+    },
+  }),
+  limits: {
+    fileSize: maxUploadBytes,
+    files: maxEditImages,
+  },
+  fileFilter(req, file, cb) {
+    if (!["image/png", "image/jpeg", "image/webp"].includes(file.mimetype)) {
+      cb(new Error("仅支持 PNG、JPG、JPEG、WEBP 图片。"));
+      return;
+    }
+    cb(null, true);
+  },
+});
+
 app.get("/api/health", (req, res) => {
-  res.json({ ok: true });
+  res.json({ ok: true, workerConcurrency });
 });
 
 app.post("/api/auth/login", async (req, res) => {
@@ -491,13 +1111,14 @@ app.get("/api/admin/dashboard", requireAdmin, (req, res) => {
   const successCalls = db.prepare("SELECT COUNT(*) AS value FROM generation_logs WHERE status = 'success'").get().value;
   const todayStart = new Date();
   todayStart.setHours(0, 0, 0, 0);
-  const todayCalls = db
-    .prepare("SELECT COUNT(*) AS value FROM generation_logs WHERE created_at >= ?")
-    .get(todayStart.toISOString()).value;
+  const todayCalls = db.prepare("SELECT COUNT(*) AS value FROM generation_logs WHERE created_at >= ?").get(todayStart.toISOString()).value;
   const totalRemaining = db.prepare("SELECT COALESCE(SUM(quota_remaining), 0) AS value FROM users").get().value;
   const recentLogs = db
     .prepare(
-      "SELECT id, username, display_name, created_at, model, prompt, size, quality, status, error_message FROM generation_logs ORDER BY created_at DESC LIMIT 8",
+      `SELECT id, username, display_name, created_at, model, prompt, size, quality, status, error_message, image_url
+       FROM generation_logs
+       ORDER BY created_at DESC
+       LIMIT 8`,
     )
     .all();
 
@@ -548,6 +1169,7 @@ app.delete("/api/admin/users/:id", requireAdmin, async (req, res) => {
   db.exec("BEGIN");
   try {
     db.prepare("DELETE FROM sessions WHERE user_id = ?").run(id);
+    db.prepare("DELETE FROM generation_jobs WHERE user_id = ?").run(id);
     db.prepare("DELETE FROM generations WHERE user_id = ?").run(id);
     db.prepare("DELETE FROM users WHERE id = ?").run(id);
     db.exec("COMMIT");
@@ -584,16 +1206,8 @@ app.post("/api/admin/generations/transfer", requireAdmin, async (req, res) => {
   if (!fromUser || !toUser) return res.status(404).json({ error: "用户不存在。" });
 
   try {
-    const rows = db.prepare("SELECT id, image_url, stored_image_path FROM generations WHERE user_id = ?").all(fromUserId);
-    await moveGenerationImagesToUser(rows, toUser.username);
-    db.prepare("UPDATE generations SET user_id = ? WHERE user_id = ?").run(toUserId, fromUserId);
-    db.prepare("UPDATE generation_logs SET user_id = ?, username = ?, display_name = ? WHERE user_id = ?").run(
-      toUserId,
-      toUser.username,
-      toUser.display_name,
-      fromUserId,
-    );
-
+    const rows = db.prepare("SELECT id, user_id, image_url, stored_image_path FROM generations WHERE user_id = ?").all(fromUserId);
+    await moveGenerationImagesToUser(rows, toUser);
     res.json({ ok: true, transferred: rows.length });
   } catch (error) {
     await logServer("admin.generations_transfer_failed", {
@@ -633,31 +1247,35 @@ app.get("/api/admin/generation-logs", requireAdmin, (req, res) => {
   const filters = [];
   const params = [];
   if (req.query.userId) {
-    filters.push("user_id = ?");
+    filters.push("gl.user_id = ?");
     params.push(Number(req.query.userId));
   }
   if (req.query.status) {
-    filters.push("status = ?");
+    filters.push("gl.status = ?");
     params.push(String(req.query.status));
   }
   if (req.query.from) {
-    filters.push("created_at >= ?");
+    filters.push("gl.created_at >= ?");
     params.push(String(req.query.from));
   }
   if (req.query.to) {
-    filters.push("created_at <= ?");
+    filters.push("gl.created_at <= ?");
     params.push(String(req.query.to));
   }
 
   const page = Math.max(1, Number(req.query.page || 1));
   const pageSize = Math.min(100, Math.max(1, Number(req.query.pageSize || 30)));
   const where = filters.length ? `WHERE ${filters.join(" AND ")}` : "";
-  const total = db.prepare(`SELECT COUNT(*) AS value FROM generation_logs ${where}`).get(...params).value;
+  const total = db.prepare(`SELECT COUNT(*) AS value FROM generation_logs gl ${where}`).get(...params).value;
   const data = db
     .prepare(
-      `SELECT id, user_id, username, display_name, created_at, provider_id, model, prompt, size, quality, count, mode, status, generation_id, error_message, duration_ms, params_json
-       FROM generation_logs ${where}
-       ORDER BY created_at DESC
+      `SELECT gl.id, gl.user_id, gl.username, gl.display_name, gl.created_at, gl.updated_at, gl.provider_id, gl.model, gl.prompt,
+              gl.size, gl.quality, gl.count, gl.mode, gl.status, gl.generation_id, gl.job_id, gl.error_message, gl.duration_ms,
+              gl.params_json, gl.attempt_count, COALESCE(gl.image_url, g.image_url) AS image_url
+       FROM generation_logs gl
+       LEFT JOIN generations g ON g.id = gl.generation_id
+       ${where}
+       ORDER BY gl.created_at DESC
        LIMIT ? OFFSET ?`,
     )
     .all(...params, pageSize, (page - 1) * pageSize);
@@ -665,154 +1283,134 @@ app.get("/api/admin/generation-logs", requireAdmin, (req, res) => {
 });
 
 app.get("/api/images/history", requireUser, (req, res) => {
-  const rows = db
-    .prepare("SELECT * FROM generations WHERE user_id = ? ORDER BY created_at DESC LIMIT 100")
-    .all(req.auth.user.id);
+  const rows = db.prepare("SELECT * FROM generations WHERE user_id = ? ORDER BY created_at DESC LIMIT 100").all(req.auth.user.id);
   res.json({ data: rows.map(generationFromRow) });
+});
+
+app.delete("/api/images/history/:id", requireUser, async (req, res) => {
+  const row = db.prepare("SELECT * FROM generations WHERE id = ? AND user_id = ?").get(req.params.id, req.auth.user.id);
+  if (!row) return res.status(404).json({ error: "历史记录不存在。" });
+
+  db.prepare("DELETE FROM generations WHERE id = ?").run(row.id);
+  const absolutePath = absoluteStoredPath(row.stored_image_path);
+  if (absolutePath && syncFs.existsSync(absolutePath)) {
+    await fs.rm(absolutePath, { force: true }).catch(() => null);
+  } else if (row.stored_image_path) {
+    await logServer("generation.history_delete_missing_file", {
+      generationId: row.id,
+      storedImagePath: row.stored_image_path,
+      userId: req.auth.user.id,
+    });
+  }
+
+  res.json({ ok: true });
 });
 
 app.use("/api/generated-images", express.static(generatedImagesDir));
 
 app.post("/api/images/generations", requireUser, async (req, res) => {
-  const startedAt = Date.now();
   const user = db.prepare("SELECT * FROM users WHERE id = ?").get(req.auth.user.id);
-  const { providerId, model, prompt, size, quality, count, mode } = req.body ?? {};
-  const requestShape = {
-    providerId,
-    model,
-    prompt: typeof prompt === "string" ? prompt.trim() : "",
-    size: size || "auto",
-    quality: quality || "auto",
-    count: Number(count || 1),
-    mode: mode || "generate",
-  };
+  const requestShape = validateRequestShape(req.body);
 
   await logServer("generation.request", {
-    providerId,
-    model,
-    size,
-    quality,
+    providerId: req.body?.providerId,
+    model: req.body?.model,
+    size: req.body?.size,
+    quality: req.body?.quality,
     userId: user.id,
     username: user.username,
-    promptLength: requestShape.prompt.length,
+    promptLength: String(req.body?.prompt || "").trim().length,
+    mode: "generate",
   });
 
-  if (!requestShape.model || !requestShape.prompt) {
-    writeGenerationLog({ user, request: requestShape, status: "validation_failed", errorMessage: "Model and prompt are required.", startedAt });
-    return res.status(400).json({ error: "Model and prompt are required." });
+  if (requestShape.error) {
+    return res.status(400).json({ error: requestShape.error });
   }
-
   if (user.quota_remaining <= 0) {
-    writeGenerationLog({ user, request: requestShape, status: "quota_exhausted", errorMessage: "可用生图次数不足。", startedAt });
     return res.status(403).json({ error: "可用生图次数不足，请联系管理员增加次数。" });
   }
-
-  const adapter = getGenerationAdapter(providerId, model);
-  if (!adapter) {
-    writeGenerationLog({ user, request: requestShape, status: "validation_failed", errorMessage: "Unsupported provider/model combination.", startedAt });
+  if (!getGenerationAdapter(requestShape.providerId, requestShape.model)) {
     return res.status(400).json({ error: "Unsupported provider/model combination." });
   }
 
   try {
-    adapter.assertConfigured();
-    const request = adapter.buildRequest({ ...requestShape, userId: user.id });
-    await logServer("generation.upstream_start", { adapterId: adapter.id });
-    const upstream = await fetch(request.url, request.options);
-    await logServer("generation.upstream_response", { adapterId: adapter.id, status: upstream.status });
-
-    const text = await upstream.text();
-    let payload;
-    try {
-      payload = text ? JSON.parse(text) : {};
-    } catch {
-      payload = { raw: text };
-    }
-
-    if (!upstream.ok) {
-      const message = payload?.error?.message || payload?.error || "Image generation failed.";
-      writeGenerationLog({ user, request: requestShape, status: "upstream_error", errorMessage: message, startedAt });
-      await logServer("generation.upstream_error", { adapterId: adapter.id, status: upstream.status, error: message });
-      return res.status(upstream.status).json({ error: message, details: payload });
-    }
-
-    const parsed = adapter.parseResponse(payload);
-    const id = `gen_${Date.now()}`;
-    let cachedImage = null;
-    try {
-      cachedImage = await cacheGeneratedImage(id, parsed.originalImageUrl, user.username);
-    } catch {
-      cachedImage = null;
-    }
-
-    const record = {
-      id,
-      userId: user.id,
-      createdAt: nowIso(),
-      providerId,
-      adapterId: adapter.id,
-      model: parsed.model,
-      prompt: requestShape.prompt,
-      revisedPrompt: parsed.revisedPrompt,
-      size: requestShape.size,
-      quality: requestShape.quality,
-      count: requestShape.count,
-      mode: requestShape.mode,
-      imageUrl: cachedImage?.storedImageUrl || parsed.imageUrl,
-      originalImageUrl: parsed.originalImageUrl,
-      storedImagePath: cachedImage?.storedImagePath || null,
-      imageContentType: cachedImage?.contentType || null,
-      status: "done",
-      usage: parsed.usage,
-      raw: parsed.raw,
-    };
-
-    db.exec("BEGIN");
-    try {
-      saveGeneration(record);
-      db.prepare("UPDATE users SET quota_remaining = quota_remaining - 1, updated_at = ? WHERE id = ?").run(nowIso(), user.id);
-      db.exec("COMMIT");
-    } catch (error) {
-      db.exec("ROLLBACK");
-      throw error;
-    }
+    const { jobId } = enqueueJob({
+      user,
+      type: "generate",
+      request: { ...requestShape, mode: "generate" },
+      inputFiles: [],
+    });
+    void scheduleWorkers();
     const updatedUser = db.prepare("SELECT * FROM users WHERE id = ?").get(user.id);
-    writeGenerationLog({ user: updatedUser, request: requestShape, status: "success", generationId: record.id, startedAt });
-
-    await logServer("generation.success", {
-      id: record.id,
-      adapterId: adapter.id,
-      storedImage: Boolean(record.storedImagePath),
-      hasOriginalUrl: Boolean(record.originalImageUrl),
-    });
-
-    res.json({
-      ...generationFromRow({
-        id: record.id,
-        user_id: record.userId,
-        created_at: record.createdAt,
-        provider_id: record.providerId,
-        adapter_id: record.adapterId,
-        model: record.model,
-        prompt: record.prompt,
-        revised_prompt: record.revisedPrompt,
-        size: record.size,
-        quality: record.quality,
-        count: record.count,
-        mode: record.mode,
-        image_url: record.imageUrl,
-        original_image_url: record.originalImageUrl,
-        stored_image_path: record.storedImagePath,
-        image_content_type: record.imageContentType,
-        status: record.status,
-        usage_json: JSON.stringify(record.usage || null),
-      }),
-      quotaRemaining: updatedUser.quota_remaining,
-    });
+    res.status(202).json({ jobId, status: "queued", quotaRemaining: updatedUser.quota_remaining });
   } catch (error) {
-    writeGenerationLog({ user, request: requestShape, status: "failed", errorMessage: error?.message || "Unable to call image provider.", startedAt });
-    await logServer("generation.failed", { providerId, model, error: error?.message || "Unable to call image provider." });
-    res.status(502).json({ error: error?.message || "Unable to call image provider." });
+    res.status(500).json({ error: error?.message || "任务提交失败，请稍后重试。" });
   }
+});
+
+app.post("/api/images/edits", requireUser, prepareEditUpload, upload.array("image", maxEditImages), async (req, res) => {
+  const user = db.prepare("SELECT * FROM users WHERE id = ?").get(req.auth.user.id);
+  const requestShape = validateRequestShape(req.body, { requireImages: true });
+  const uploadedFiles = (req.files || []).map((file) => ({
+    jobId: req.pendingUploadId,
+    fieldName: file.fieldname,
+    originalName: file.originalname,
+    fileName: file.filename,
+    mimeType: file.mimetype,
+    size: file.size,
+    absolutePath: file.path,
+    relativePath: path.relative(__dirname, file.path).replaceAll("\\", "/"),
+  }));
+
+  await logServer("generation.request", {
+    providerId: req.body?.providerId,
+    model: req.body?.model,
+    size: req.body?.size,
+    quality: req.body?.quality,
+    userId: user.id,
+    username: user.username,
+    promptLength: String(req.body?.prompt || "").trim().length,
+    mode: "edit",
+    images: uploadedFiles.length,
+  });
+
+  if (requestShape.error) {
+    await fs.rm(jobInputDir(req.pendingUploadId), { recursive: true, force: true }).catch(() => null);
+    return res.status(400).json({ error: requestShape.error });
+  }
+  if (!uploadedFiles.length) {
+    await fs.rm(jobInputDir(req.pendingUploadId), { recursive: true, force: true }).catch(() => null);
+    return res.status(400).json({ error: "请至少上传一张参考图。" });
+  }
+  if (user.quota_remaining <= 0) {
+    await fs.rm(jobInputDir(req.pendingUploadId), { recursive: true, force: true }).catch(() => null);
+    return res.status(403).json({ error: "可用生图次数不足，请联系管理员增加次数。" });
+  }
+  if (!getGenerationAdapter(requestShape.providerId, requestShape.model)) {
+    await fs.rm(jobInputDir(req.pendingUploadId), { recursive: true, force: true }).catch(() => null);
+    return res.status(400).json({ error: "Unsupported provider/model combination." });
+  }
+
+  try {
+    const { jobId } = enqueueJob({
+      user,
+      type: "edit",
+      request: { ...requestShape, mode: "edit" },
+      inputFiles: uploadedFiles,
+    });
+    void scheduleWorkers();
+    const updatedUser = db.prepare("SELECT * FROM users WHERE id = ?").get(user.id);
+    res.status(202).json({ jobId, status: "queued", quotaRemaining: updatedUser.quota_remaining });
+  } catch (error) {
+    await fs.rm(jobInputDir(req.pendingUploadId), { recursive: true, force: true }).catch(() => null);
+    res.status(500).json({ error: error?.message || "任务提交失败，请稍后重试。" });
+  }
+});
+
+app.get("/api/jobs/:id", requireUser, (req, res) => {
+  const job = db.prepare("SELECT * FROM generation_jobs WHERE id = ? AND user_id = ?").get(req.params.id, req.auth.user.id);
+  if (!job) return res.status(404).json({ error: "任务不存在。" });
+  res.json(jobResponse(job));
 });
 
 app.get("/api/images/proxy", async (req, res) => {
@@ -836,10 +1434,34 @@ app.get("/api/images/proxy", async (req, res) => {
   }
 });
 
+app.use((error, req, res, next) => {
+  if (!(error instanceof multer.MulterError) && !error?.message) {
+    next(error);
+    return;
+  }
+
+  if (error instanceof multer.MulterError) {
+    if (error.code === "LIMIT_FILE_SIZE") {
+      res.status(400).json({ error: "单张参考图不能超过 10MB。" });
+      return;
+    }
+    if (error.code === "LIMIT_FILE_COUNT") {
+      res.status(400).json({ error: `最多只能上传 ${maxEditImages} 张参考图。` });
+      return;
+    }
+  }
+
+  res.status(400).json({ error: error.message || "上传图片失败，请检查文件格式和大小。" });
+});
+
 app.use(express.static(path.join(__dirname, "dist")));
 app.get(/.*/, (req, res) => {
   res.sendFile(path.join(__dirname, "dist", "index.html"));
 });
+
+await recoverIncompleteJobs();
+await repairStoredGenerationFiles();
+void scheduleWorkers();
 
 const server = app.listen(port, () => {
   console.log(`Panghu API server listening on http://localhost:${port}`);

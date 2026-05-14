@@ -14,8 +14,9 @@ import {
   Save,
   Send,
   SlidersHorizontal,
-  Sparkles,
   Sun,
+  Trash2,
+  Upload,
   UserPlus,
   Users,
   Wand2,
@@ -26,6 +27,12 @@ import { getModelsForProvider, getParamOptions, normalizeModelState } from "./co
 import { getTheme, toggleTheme } from "./theme.js";
 import { appConfig } from "./appConfig.js";
 
+const maxEditImages = 6;
+const maxPromptLength = 32000;
+const pollIntervalMs = 3000;
+const pollTimeoutMs = 1000 * 60 * 12;
+
+// 主状态树：当前项目仍是 Vanilla JS 全量重渲染模式，所有界面都从这里派生。
 const state = {
   route: window.location.pathname.startsWith("/admin") ? "admin" : window.location.pathname.startsWith("/login") ? "login" : "app",
   mode: "generate",
@@ -37,11 +44,14 @@ const state = {
   prompt: "",
   history: [],
   selectedId: null,
+  editFiles: [],
   isGenerating: false,
   generationStartedAt: null,
   elapsedSeconds: 0,
+  activeJobId: null,
+  activeJobStatus: "",
+  activeJobAttempts: 0,
   leftCollapsed: false,
-  showEditNotice: false,
   showBackendNotice: false,
   apiError: "",
   authReady: false,
@@ -67,15 +77,14 @@ const state = {
       password: "",
       quotaRemaining: 10,
     },
-    transfer: {
-      fromUserId: "",
-      toUserId: "",
-    },
   },
 };
 
 const app = document.querySelector("#app");
 let generationTimer = null;
+let adminRefreshTimer = null;
+const mobileQuery = window.matchMedia("(max-width: 768px)");
+state.leftCollapsed = mobileQuery.matches;
 
 const icons = {
   BarChart3,
@@ -92,8 +101,9 @@ const icons = {
   Save,
   Send,
   SlidersHorizontal,
-  Sparkles,
   Sun,
+  Trash2,
+  Upload,
   UserPlus,
   Users,
   Wand2,
@@ -103,12 +113,23 @@ const icons = {
 function routeTo(path) {
   window.history.pushState({}, "", path);
   state.route = path.startsWith("/admin") ? "admin" : path.startsWith("/login") ? "login" : "app";
+  if (state.route === "app" && mobileQuery.matches) {
+    state.leftCollapsed = true;
+  }
   render();
   if (state.route === "admin") loadAdminSession();
+  syncAdminRefresh();
 }
 
 window.addEventListener("popstate", () => {
   state.route = window.location.pathname.startsWith("/admin") ? "admin" : window.location.pathname.startsWith("/login") ? "login" : "app";
+  render();
+  syncAdminRefresh();
+});
+
+mobileQuery.addEventListener("change", (event) => {
+  if (state.route !== "app") return;
+  state.leftCollapsed = event.matches;
   render();
 });
 
@@ -173,7 +194,18 @@ function formatElapsed(seconds) {
   return `${String(minutes).padStart(2, "0")}:${String(rest).padStart(2, "0")}`;
 }
 
+function jobStatusText(status) {
+  if (status === "queued") return "排队中";
+  if (status === "processing") return "处理中";
+  if (status === "retrying") return "等待重试";
+  if (status === "done") return "已完成";
+  if (status === "failed") return "失败";
+  return "处理中";
+}
+
 function generationTip() {
+  if (state.activeJobStatus === "retrying") return "上游暂时不可用，10 秒后会自动重试";
+  if (state.activeJobStatus === "queued") return "任务已提交，正在进入处理队列";
   if (state.elapsedSeconds < 20) return "正在提交任务，请稍候片刻";
   if (state.elapsedSeconds < 90) return "图片正在生成中，复杂画面可能需要更久";
   if (state.elapsedSeconds < 210) return "仍在等待模型返回，请耐心等待";
@@ -220,7 +252,139 @@ function currentRequestShape() {
 }
 
 function canGenerate() {
-  return Boolean(state.currentUser) && state.currentUser.quotaRemaining > 0 && !state.isGenerating && state.mode !== "edit";
+  return Boolean(state.currentUser) && state.currentUser.quotaRemaining > 0 && !state.isGenerating;
+}
+
+function clearEditFiles() {
+  // 预览图使用了 Object URL，不主动释放的话浏览器会一直占用内存。
+  for (const item of state.editFiles) {
+    URL.revokeObjectURL(item.previewUrl);
+  }
+  state.editFiles = [];
+}
+
+function buildPreviewFiles(files) {
+  return files.map((file) => ({
+    id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    file,
+    previewUrl: URL.createObjectURL(file),
+    name: file.name,
+    size: file.size,
+    type: file.type,
+  }));
+}
+
+function appendEditFiles(fileList) {
+  const incoming = Array.from(fileList || []);
+  if (!incoming.length) return;
+
+  const available = maxEditImages - state.editFiles.length;
+  const picked = incoming.slice(0, Math.max(0, available));
+  if (!picked.length) {
+    state.apiError = `最多只能上传 ${maxEditImages} 张参考图。`;
+    return;
+  }
+
+  state.editFiles = [...state.editFiles, ...buildPreviewFiles(picked)];
+  if (incoming.length > picked.length) {
+    state.apiError = `最多只能上传 ${maxEditImages} 张参考图。`;
+  }
+}
+
+function removeEditFile(fileId) {
+  const file = state.editFiles.find((item) => item.id === fileId);
+  if (file) URL.revokeObjectURL(file.previewUrl);
+  state.editFiles = state.editFiles.filter((item) => item.id !== fileId);
+}
+
+function buildHistoryItem(result, request) {
+  return {
+    id: result.id || `hist-${Date.now()}`,
+    userId: result.userId,
+    createdAt: result.createdAt || new Date().toISOString(),
+    prompt: result.prompt || request.prompt,
+    revisedPrompt: result.revisedPrompt || null,
+    providerId: result.providerId || request.providerId,
+    model: result.model || request.model,
+    size: result.size || request.size,
+    quality: result.quality || request.quality,
+    count: result.count || request.count,
+    mode: result.mode || request.mode,
+    imageUrl: result.imageUrl,
+    status: result.status || "done",
+    usage: result.usage || null,
+    request: result.request || null,
+  };
+}
+
+function upsertHistoryItem(nextItem) {
+  state.history = [nextItem, ...state.history.filter((item) => item.id !== nextItem.id)];
+  state.selectedId = nextItem.id;
+}
+
+function editPreviewStage() {
+  if (!state.editFiles.length) return "";
+  return `
+    <div class="edit-preview-grid">
+      ${state.editFiles
+        .slice(0, 4)
+        .map(
+          (file) => `
+            <figure class="edit-preview-card">
+              <img src="${escapeHtml(file.previewUrl)}" alt="${escapeHtml(file.name)}" />
+            </figure>
+          `,
+        )
+        .join("")}
+    </div>
+  `;
+}
+
+function editUploadSection() {
+  if (state.mode !== "edit") return "";
+  return `
+    <div class="field edit-upload-field">
+      <span>参考图片</span>
+      <input class="hidden-file-input" data-role="edit-file-input" type="file" accept="image/png,image/jpeg,image/webp" multiple />
+      <div class="upload-toolbar compact">
+        <span class="upload-meta"><i data-lucide="wand2"></i> ${state.editFiles.length}/${maxEditImages}</span>
+        <div class="upload-actions">
+          <button class="tool-button" type="button" data-action="clear-edit-files" ${state.editFiles.length ? "" : "disabled"}><i data-lucide="x"></i><span>清空</span></button>
+        </div>
+      </div>
+      <button class="upload-dropzone compact" type="button" data-action="select-edit-images">
+        <i data-lucide="image-plus"></i>
+        <strong>上传参考图</strong>
+        <span>最多 ${maxEditImages} 张，单张 10MB</span>
+      </button>
+      ${
+        state.editFiles.length
+          ? `
+            <div class="upload-square-grid">
+              ${state.editFiles
+                .map(
+                  (file) => `
+                    <div class="upload-square-card">
+                      <button class="upload-square-thumb" type="button" data-action="preview-edit-file" data-preview-src="${escapeHtml(file.previewUrl)}" data-preview-name="${escapeHtml(file.name)}" aria-label="查看参考图">
+                        <img src="${escapeHtml(file.previewUrl)}" alt="${escapeHtml(file.name)}" />
+                      </button>
+                      <button class="thumb-remove" type="button" data-action="remove-edit-file" data-file-id="${file.id}" aria-label="删除参考图">
+                        <i data-lucide="x"></i>
+                      </button>
+                    </div>
+                  `,
+                )
+                .join("")}
+            </div>
+          `
+          : ""
+      }
+    </div>
+  `;
+}
+
+function promptMetaText() {
+  return `${state.prompt.trim().length}/${maxPromptLength}`;
 }
 
 function render() {
@@ -248,10 +412,11 @@ function renderApp() {
   const qualityOptions = getParamOptions(state.providerId, state.model, "quality");
   const user = state.currentUser;
   const sendDisabled = !canGenerate();
-  const sendTitle = !user ? "请先登录" : user.quotaRemaining <= 0 ? "可用次数不足" : "生成图片";
+  const sendTitle = !user ? "请先登录" : user.quotaRemaining <= 0 ? "可用次数不足" : state.mode === "edit" ? "开始图生图" : "生成图片";
 
   app.innerHTML = `
     <main class="shell ${state.leftCollapsed ? "is-left-collapsed" : ""}">
+      ${!state.leftCollapsed && mobileQuery.matches ? `<button class="mobile-sidebar-backdrop" data-action="toggle-left" aria-label="关闭参数面板"></button>` : ""}
       <section class="sidebar settings-panel" aria-label="生成参数">
         <div class="brand-row">
           <div class="brand-mark">胖</div>
@@ -311,6 +476,8 @@ function renderApp() {
           <input data-field="count" type="number" min="1" max="1" step="1" value="1" inputmode="numeric" />
         </label>
 
+        ${editUploadSection()}
+
         <div class="user-card">
           ${
             user
@@ -357,27 +524,36 @@ function renderApp() {
                     <div class="generation-orbit" aria-hidden="true"><span></span><span></span><span></span></div>
                     <strong>正在生成，请耐心等待</strong>
                     <span>${generationTip()}</span>
-                    <em>已等待 ${formatElapsed(state.elapsedSeconds)}，通常需要 1-5 分钟</em>
+                    <em>状态：${jobStatusText(state.activeJobStatus)} · 第 ${Math.max(1, state.activeJobAttempts || 1)} 次尝试 · 已等待 ${formatElapsed(state.elapsedSeconds)}</em>
                   </div>
                 `
                 : item
                   ? `<img src="${escapeHtml(item.imageUrl)}" alt="${escapeHtml(item.prompt)}" data-action="fullscreen" />`
-                  : `<div class="empty-state"><i data-lucide="image-plus"></i><strong>${user ? "暂无图片" : "请先登录"}</strong><span>${user ? "输入提示词，创造属于你的图片" : "登录后即可生成图片并查看个人历史"}</span></div>`
+                  : state.mode === "edit" && state.editFiles.length
+                    ? editPreviewStage()
+                    : `<div class="empty-state"><i data-lucide="image-plus"></i><strong>${user ? (state.mode === "edit" ? "上传参考图开始编辑" : "暂无图片") : "请先登录"}</strong><span>${user ? (state.mode === "edit" ? "支持多张参考图，上传后可继续输入修改描述" : "输入提示词，创造属于你的图片") : "登录后即可生成图片并查看个人历史"}</span></div>`
             }
           </div>
         </div>
 
         <form class="prompt-box" data-role="prompt-form">
-          <textarea
-            data-field="prompt"
-            rows="3"
-            ${state.mode === "edit" ? "disabled" : ""}
-            placeholder="${user ? "输入你的图片描述，文本绘制用中文双引号 “” 包裹" : "请先登录后输入提示词"}"
-          >${escapeHtml(state.prompt)}</textarea>
-          <div class="prompt-actions">
-            <button type="submit" class="send-button" ${sendDisabled ? "disabled" : ""} title="${sendTitle}" aria-label="${sendTitle}">
-              <i data-lucide="send"></i>
-            </button>
+          <div class="prompt-editor">
+            <div class="prompt-input-wrap">
+              <textarea
+                data-field="prompt"
+                rows="3"
+                maxlength="${maxPromptLength}"
+                placeholder="${user ? (state.mode === "edit" ? "描述你希望如何修改这些图片" : "输入你的图片描述，文本绘制用中文双引号 “” 包裹") : "请先登录后输入提示词"}"
+              >${escapeHtml(state.prompt)}</textarea>
+              <div class="prompt-overlay">
+                <span class="prompt-meta inline">提示词长度 ${promptMetaText()}</span>
+                <div class="prompt-actions inline">
+                  <button type="submit" class="send-button" ${sendDisabled ? "disabled" : ""} title="${sendTitle}" aria-label="${sendTitle}">
+                    <i data-lucide="send"></i>
+                  </button>
+                </div>
+              </div>
+            </div>
           </div>
         </form>
         ${state.apiError ? `<div class="error-toast" role="alert">${escapeHtml(state.apiError)}</div>` : ""}
@@ -398,11 +574,17 @@ function renderApp() {
                 ? state.history
                     .map(
                       (historyItem) => `
-                <button class="thumb ${historyItem.id === state.selectedId ? "active" : ""}" data-history-id="${historyItem.id}" title="${escapeHtml(historyItem.prompt)}">
-                  <img src="${escapeHtml(historyItem.imageUrl)}" alt="${escapeHtml(historyItem.prompt)}" />
-                  <span>${formatTime(historyItem.createdAt)}</span>
-                </button>
-              `,
+                        <div class="thumb-card ${historyItem.id === state.selectedId ? "active" : ""}">
+                          <button class="thumb history-select" data-history-id="${historyItem.id}" title="${escapeHtml(historyItem.prompt)}">
+                            <img src="${escapeHtml(historyItem.imageUrl)}" alt="${escapeHtml(historyItem.prompt)}" />
+                            <span>${formatTime(historyItem.createdAt)}</span>
+                            <em class="history-mode">${historyItem.mode === "edit" ? "图生图" : "文生图"}</em>
+                          </button>
+                          <button class="history-delete" type="button" data-action="delete-history" data-history-id="${historyItem.id}" aria-label="删除历史">
+                            <i data-lucide="trash-2"></i>
+                          </button>
+                        </div>
+                      `,
                     )
                     .join("")
                 : `<div class="history-empty">暂未有历史图片</div>`
@@ -410,7 +592,6 @@ function renderApp() {
         </div>
       </aside>
 
-      ${noticeModal("showEditNotice", "图生图即将到来", "图片编辑功能会在后续版本支持。当前先回到文生图模式继续生成新图片。", "close-edit-notice")}
       ${noticeModal("showBackendNotice", "后端服务未启动", "当前无法连接生图服务，请联系管理员或先启动后端服务后再生成图片。", "close-backend-notice")}
     </main>
   `;
@@ -425,7 +606,7 @@ function noticeModal(flag, title, message, action) {
       <div class="modal-backdrop" role="presentation">
         <section class="notice-dialog" role="dialog" aria-modal="true">
           <button class="icon-button ghost dialog-close" data-action="${action}" aria-label="关闭提示"><i data-lucide="x"></i></button>
-          <div class="notice-icon"><i data-lucide="sparkles"></i></div>
+          <div class="notice-icon"><i data-lucide="wand2"></i></div>
           <h2>${title}</h2>
           <p>${message}</p>
           <button class="primary-action" data-action="${action}" autofocus><i data-lucide="check"></i><span>OK</span></button>
@@ -541,13 +722,13 @@ function adminDashboardHtml() {
     <section class="admin-table-panel">
       <h3>最近调用</h3>
       <div class="admin-table">
-        <div class="table-row table-head"><span>时间</span><span>用户</span><span>模型</span><span>状态</span><span>提示词</span></div>
+        <div class="table-row table-head dashboard-row"><span>时间</span><span>用户</span><span>模型</span><span>状态</span><span>提示词</span></div>
         ${
           recent.length
             ? recent
                 .map(
                   (log) =>
-                    `<div class="table-row"><span>${formatDateTime(log.created_at)}</span><span>${escapeHtml(log.display_name || log.username || "-")}</span><span>${escapeHtml(log.model || "-")}</span><span>${escapeHtml(log.status)}</span><span>${escapeHtml(log.prompt || "-")}</span></div>`,
+                    `<div class="table-row dashboard-row"><span>${formatDateTime(log.created_at)}</span><span>${escapeHtml(log.display_name || log.username || "-")}</span><span>${escapeHtml(log.model || "-")}</span><span>${escapeHtml(log.status)}</span><span>${escapeHtml(log.prompt || "-")}</span></div>`,
                 )
                 .join("")
             : `<div class="table-empty">暂无调用记录</div>`
@@ -596,18 +777,18 @@ function adminUsersHtml() {
             ? state.admin.users
                 .map(
                   (user) => `
-            <form class="table-row user-row" data-role="update-user-form" data-user-id="${user.id}">
-              <span>${escapeHtml(user.username)}</span>
-              <input name="displayName" value="${escapeHtml(user.displayName)}" />
-              <input name="quotaRemaining" type="number" min="0" step="1" value="${Number(user.quotaRemaining)}" />
-              <label class="switch-label"><input name="isEnabled" type="checkbox" ${user.isEnabled ? "checked" : ""} />启用</label>
-              <input name="password" type="password" placeholder="留空不变" />
-              <div class="row-actions">
-                <button class="tool-button" type="submit"><i data-lucide="save"></i><span>保存</span></button>
-                <button class="tool-button danger-button" type="button" data-action="delete-user" data-user-id="${user.id}" data-username="${escapeHtml(user.username)}"><i data-lucide="x"></i><span>删除</span></button>
-              </div>
-            </form>
-          `,
+                    <form class="table-row user-row" data-role="update-user-form" data-user-id="${user.id}">
+                      <span>${escapeHtml(user.username)}</span>
+                      <input name="displayName" value="${escapeHtml(user.displayName)}" />
+                      <input name="quotaRemaining" type="number" min="0" step="1" value="${Number(user.quotaRemaining)}" />
+                      <label class="switch-label"><input name="isEnabled" type="checkbox" ${user.isEnabled ? "checked" : ""} />启用</label>
+                      <input name="password" type="password" placeholder="留空不变" />
+                      <div class="row-actions">
+                        <button class="tool-button" type="submit"><i data-lucide="save"></i><span>保存</span></button>
+                        <button class="tool-button danger-button" type="button" data-action="delete-user" data-user-id="${user.id}" data-username="${escapeHtml(user.username)}"><i data-lucide="x"></i><span>删除</span></button>
+                      </div>
+                    </form>
+                  `,
                 )
                 .join("")
             : `<div class="table-empty">暂无用户</div>`
@@ -622,21 +803,22 @@ function adminLogsHtml() {
     <section class="admin-table-panel">
       <h3>使用统计日志</h3>
       <div class="admin-table logs-table">
-        <div class="table-row logs-row table-head"><span>时间</span><span>用户</span><span>模型</span><span>参数</span><span>状态</span><span>提示词</span></div>
+        <div class="table-row logs-row table-head"><span>时间</span><span>用户</span><span>模型</span><span>参数</span><span>状态</span><span>图片</span><span>提示词</span></div>
         ${
           state.admin.logs.length
             ? state.admin.logs
                 .map(
                   (log) => `
-            <div class="table-row logs-row">
-              <span>${formatDateTime(log.created_at)}</span>
-              <span>${escapeHtml(log.display_name || log.username || "-")}</span>
-              <span>${escapeHtml(log.model || "-")}</span>
-              <span>${escapeHtml([log.size, log.quality].filter(Boolean).join(" / ") || "-")}</span>
-              <span title="${escapeHtml(log.error_message || "")}">${escapeHtml(log.status)}</span>
-              <span>${escapeHtml(log.prompt || "-")}</span>
-            </div>
-          `,
+                    <div class="table-row logs-row">
+                      <span>${formatDateTime(log.created_at)}</span>
+                      <span>${escapeHtml(log.display_name || log.username || "-")}</span>
+                      <span>${escapeHtml(log.model || "-")}</span>
+                      <span>${escapeHtml([log.size, log.quality].filter(Boolean).join(" / ") || "-")}</span>
+                      <span title="${escapeHtml(log.error_message || "")}">${escapeHtml(`${log.status}${log.attempt_count ? ` · ${log.attempt_count}次` : ""}`)}</span>
+                      <span>${log.image_url ? `<a class="admin-image-link" href="${escapeHtml(log.image_url)}" target="_blank" rel="noreferrer"><img src="${escapeHtml(log.image_url)}" alt="生成图片" /></a>` : `<em class="missing-image">无图</em>`}</span>
+                      <span>${escapeHtml(log.prompt || "-")}</span>
+                    </div>
+                  `,
                 )
                 .join("")
             : `<div class="table-empty">暂无日志</div>`
@@ -663,8 +845,7 @@ function bindAppEvents() {
 
   app.querySelectorAll("[data-mode]").forEach((button) => {
     button.addEventListener("click", () => {
-      if (button.dataset.mode === "edit") state.showEditNotice = true;
-      else state.mode = "generate";
+      state.mode = button.dataset.mode;
       render();
     });
   });
@@ -676,6 +857,15 @@ function bindAppEvents() {
       render();
     });
   });
+
+  const editInput = app.querySelector("[data-role='edit-file-input']");
+  if (editInput) {
+    editInput.addEventListener("change", (event) => {
+      appendEditFiles(event.currentTarget.files);
+      event.currentTarget.value = "";
+      render();
+    });
+  }
 
   app.querySelector("[data-role='prompt-form']").addEventListener("submit", async (event) => {
     event.preventDefault();
@@ -689,19 +879,27 @@ function bindAppEvents() {
       render();
       return;
     }
+
     const textarea = app.querySelector("[data-field='prompt']");
     state.prompt = textarea.value.trim();
-    if (!state.prompt) {
+    if (!state.prompt || state.prompt.length > maxPromptLength) {
       textarea.focus();
       textarea.classList.add("is-invalid");
+      state.apiError = `提示词长度需在 1 到 ${maxPromptLength} 个字符之间。`;
       window.setTimeout(() => textarea.classList.remove("is-invalid"), 900);
+      render();
+      return;
+    }
+    if (state.mode === "edit" && !state.editFiles.length) {
+      state.apiError = "请至少上传一张参考图。";
+      render();
       return;
     }
     await generateImage();
   });
 
   app.querySelectorAll("[data-action]").forEach((button) => {
-    button.addEventListener("click", () => handleAppAction(button));
+    button.addEventListener("click", (event) => handleAppAction(button, event));
   });
 }
 
@@ -747,6 +945,7 @@ function bindAdminLoginEvents() {
       state.admin.user = result.user;
       await loadAdminData();
       render();
+      syncAdminRefresh();
     } catch (error) {
       state.admin.loginError = error.message;
     } finally {
@@ -765,6 +964,7 @@ function bindAdminEvents() {
       state.admin.error = "";
       await loadAdminData();
       render();
+      syncAdminRefresh();
     });
   });
   const createForm = app.querySelector("[data-role='create-user-form']");
@@ -785,6 +985,7 @@ function bindAdminEvents() {
         await apiJson("/api/admin/logout", { method: "POST" });
         state.admin.user = null;
         state.admin.ready = true;
+        clearAdminRefresh();
         render();
         return;
       }
@@ -797,7 +998,7 @@ function bindAdminEvents() {
   });
 }
 
-function handleAppAction(button) {
+function handleAppAction(button, event) {
   const action = button.dataset.action;
   if (handleSharedAction(action)) return;
   if (action === "toggle-left" || action === "expand-left") {
@@ -809,11 +1010,6 @@ function handleAppAction(button) {
     state.prompt = "";
     render();
   }
-  if (action === "close-edit-notice") {
-    state.showEditNotice = false;
-    state.mode = "generate";
-    render();
-  }
   if (action === "close-backend-notice") {
     state.showBackendNotice = false;
     render();
@@ -821,6 +1017,24 @@ function handleAppAction(button) {
   if (action === "download-selected") downloadSelectedImage();
   if (action === "fullscreen") openFullscreen(button.src);
   if (action === "logout") logout();
+  if (action === "select-edit-images") {
+    app.querySelector("[data-role='edit-file-input']")?.click();
+  }
+  if (action === "preview-edit-file") {
+    openFullscreen(button.dataset.previewSrc, button.dataset.previewName);
+  }
+  if (action === "remove-edit-file") {
+    removeEditFile(button.dataset.fileId);
+    render();
+  }
+  if (action === "clear-edit-files") {
+    clearEditFiles();
+    render();
+  }
+  if (action === "delete-history") {
+    event?.stopPropagation();
+    void deleteHistoryItem(button.dataset.historyId);
+  }
 }
 
 function handleSharedAction(action) {
@@ -841,20 +1055,25 @@ function handleSharedAction(action) {
 }
 
 async function apiJson(url, options = {}) {
+  const headers = { ...(options.headers || {}) };
+  if (!(options.body instanceof FormData) && !headers["Content-Type"]) {
+    headers["Content-Type"] = "application/json";
+  }
+
   const response = await fetch(url, {
-    headers: { "Content-Type": "application/json", ...(options.headers || {}) },
     credentials: "same-origin",
     ...options,
+    headers,
   });
   const result = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(result?.error || "请求失败，请稍后重试。");
   return result;
 }
 
-function openFullscreen(src) {
+function openFullscreen(src, alt = "") {
   const overlay = document.createElement("div");
   overlay.className = "fullscreen-overlay";
-  overlay.innerHTML = `<img src="${src}" />`;
+  overlay.innerHTML = `<img src="${src}" alt="${escapeHtml(alt)}" />`;
   overlay.addEventListener("click", () => overlay.remove());
   document.body.appendChild(overlay);
 }
@@ -908,6 +1127,26 @@ function extensionFromImageUrl(imageUrl) {
   return match?.[1]?.toLowerCase() || "";
 }
 
+async function pollJob(jobId) {
+  // 这里故意使用短轮询而不是长连接，便于穿过 Cloudflare 代理超时限制。
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < pollTimeoutMs) {
+    const result = await apiJson(`/api/jobs/${jobId}`);
+    state.activeJobStatus = result.status;
+    state.activeJobAttempts = result.attemptCount || 0;
+    render();
+
+    if (result.status === "done") return result.result;
+    if (result.status === "failed") {
+      throw new Error(result.error || "图片生成失败，请稍后重试。");
+    }
+
+    await new Promise((resolve) => window.setTimeout(resolve, pollIntervalMs));
+  }
+
+  throw new Error("等待任务结果超时，请稍后到历史记录中查看是否已完成。");
+}
+
 async function generateImage() {
   normalizeCount();
   state.isGenerating = true;
@@ -915,6 +1154,9 @@ async function generateImage() {
   state.apiError = "";
   state.generationStartedAt = Date.now();
   state.elapsedSeconds = 0;
+  state.activeJobId = null;
+  state.activeJobStatus = "queued";
+  state.activeJobAttempts = 0;
   startGenerationTimer();
   render();
 
@@ -926,40 +1168,57 @@ async function generateImage() {
       throw new Error("后端服务未启动，请联系管理员。");
     }
 
-    const result = await apiJson("/api/images/generations", {
-      method: "POST",
-      body: JSON.stringify(request),
-    });
+    let enqueueResult;
+    if (state.mode === "edit") {
+      // 图生图走 multipart/form-data，参考图通过重复 image 字段上传。
+      const body = new FormData();
+      body.append("providerId", request.providerId);
+      body.append("model", request.model);
+      body.append("prompt", request.prompt);
+      body.append("size", request.size);
+      body.append("quality", request.quality);
+      body.append("count", String(request.count));
+      for (const file of state.editFiles) {
+        body.append("image", file.file, file.name);
+      }
+      enqueueResult = await apiJson("/api/images/edits", {
+        method: "POST",
+        body,
+      });
+    } else {
+      enqueueResult = await apiJson("/api/images/generations", {
+        method: "POST",
+        body: JSON.stringify(request),
+      });
+    }
 
-    const nextItem = {
-      id: result.id || `hist-${Date.now()}`,
-      userId: result.userId,
-      createdAt: result.createdAt || new Date().toISOString(),
-      prompt: result.prompt || request.prompt,
-      revisedPrompt: result.revisedPrompt || null,
-      providerId: result.providerId || request.providerId,
-      model: result.model || request.model,
-      size: result.size || request.size,
-      quality: result.quality || request.quality,
-      count: result.count || request.count,
-      mode: result.mode || request.mode,
-      imageUrl: result.imageUrl,
-      status: "done",
-      usage: result.usage || null,
-    };
+    state.activeJobId = enqueueResult.jobId;
+    state.activeJobStatus = enqueueResult.status;
+    if (state.currentUser && Number.isInteger(enqueueResult.quotaRemaining)) {
+      state.currentUser.quotaRemaining = enqueueResult.quotaRemaining;
+    }
+    render();
 
-    state.history = [nextItem, ...state.history];
-    state.selectedId = nextItem.id;
-    if (state.currentUser && Number.isInteger(result.quotaRemaining)) {
-      state.currentUser.quotaRemaining = result.quotaRemaining;
+    const result = await pollJob(enqueueResult.jobId);
+    const nextItem = buildHistoryItem(result, request);
+    upsertHistoryItem(nextItem);
+    if (state.mode === "edit") {
+      clearEditFiles();
     }
   } catch (error) {
     state.apiError = state.showBackendNotice ? "" : error?.message || "图片生成失败，请稍后重试。";
     if (state.apiError.includes("登录")) state.currentUser = null;
+    if (state.currentUser) {
+      const me = await apiJson("/api/auth/me").catch(() => null);
+      if (me?.user) state.currentUser = me.user;
+    }
   } finally {
     stopGenerationTimer();
     state.isGenerating = false;
     state.generationStartedAt = null;
+    state.activeJobId = null;
+    state.activeJobStatus = "";
+    state.activeJobAttempts = 0;
     render();
   }
 }
@@ -992,12 +1251,47 @@ function stopGenerationTimer() {
   }
 }
 
+function clearAdminRefresh() {
+  if (adminRefreshTimer) {
+    window.clearInterval(adminRefreshTimer);
+    adminRefreshTimer = null;
+  }
+}
+
+function syncAdminRefresh() {
+  clearAdminRefresh();
+  if (state.route !== "admin" || !state.admin.user) return;
+  if (!["dashboard", "logs"].includes(state.admin.view)) return;
+  adminRefreshTimer = window.setInterval(() => {
+    loadAdminData().then(() => render()).catch(() => null);
+  }, 5000);
+}
+
 async function logout() {
   await apiJson("/api/auth/logout", { method: "POST" }).catch(() => null);
   state.currentUser = null;
   state.history = [];
   state.selectedId = null;
   state.apiError = "";
+  clearEditFiles();
+  render();
+}
+
+async function deleteHistoryItem(historyId) {
+  const item = state.history.find((entry) => entry.id === historyId);
+  if (!item) return;
+  const confirmed = window.confirm("确定删除这张历史图片吗？\n\n删除后会同时移除服务器上的本地缓存图片。");
+  if (!confirmed) return;
+  try {
+    await apiJson(`/api/images/history/${historyId}`, { method: "DELETE" });
+    state.history = state.history.filter((entry) => entry.id !== historyId);
+    if (state.selectedId === historyId) {
+      state.selectedId = state.history[0]?.id ?? null;
+    }
+    state.apiError = "";
+  } catch (error) {
+    state.apiError = error.message;
+  }
   render();
 }
 
@@ -1036,6 +1330,7 @@ async function loadAdminSession() {
     state.admin.ready = true;
   } finally {
     render();
+    syncAdminRefresh();
   }
 }
 
@@ -1043,6 +1338,7 @@ async function loadAdminData() {
   state.admin.error = "";
   if (!state.admin.user) return;
   try {
+    // 后台不同页签走各自的数据装载，避免一次性把不需要的数据都拉回来。
     if (state.admin.view === "dashboard") {
       state.admin.dashboard = await apiJson("/api/admin/dashboard");
     }

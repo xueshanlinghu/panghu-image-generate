@@ -1,11 +1,12 @@
 export const appConfig = {
+  // 这里保持为静态配置，前端所有下拉项都从这份声明里生成。
   providers: [{ id: "panghu", name: "胖狐API", badge: "胖狐API" }],
   models: [
     {
       id: "gpt-image-2",
       providerId: "panghu",
       name: "gpt-image-2",
-      capabilities: ["text-to-image"],
+      capabilities: ["text-to-image", "image-to-image"],
       params: {
         size: {
           defaultValue: "auto",

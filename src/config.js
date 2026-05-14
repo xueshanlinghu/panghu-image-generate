@@ -26,6 +26,7 @@ export function getParamDefault(providerId, modelId, paramName) {
 }
 
 export function normalizeModelState(state) {
+  // 根据当前 provider/model 把状态纠正到合法值，避免旧历史或切换模型后留下无效参数。
   const provider = getProvider(state.providerId);
   state.providerId = provider.id;
 

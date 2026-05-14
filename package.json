@@ -16,6 +16,7 @@
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
     "lucide": "^0.468.0",
+    "multer": "^2.1.1",
     "vite": "^6.0.1"
   },
   "devDependencies": {

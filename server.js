@@ -1,6 +1,7 @@
 import "dotenv/config";
 import express from "express";
 import multer from "multer";
+import sharp from "sharp";
 import fs from "node:fs/promises";
 import syncFs from "node:fs";
 import path from "node:path";
@@ -30,6 +31,8 @@ const logsDir = path.join(__dirname, "logs");
 const serverLogFile = path.join(logsDir, "server.log");
 const sessionCookie = "panghu_session";
 const sessionMaxAgeMs = 1000 * 60 * 60 * 24 * 7;
+const previewMaxEdge = 1600;
+const thumbnailMaxEdge = 320;
 
 await fs.mkdir(dataDir, { recursive: true });
 await fs.mkdir(generatedImagesDir, { recursive: true });
@@ -107,6 +110,10 @@ function initDb() {
       image_url TEXT,
       original_image_url TEXT,
       stored_image_path TEXT,
+      preview_image_url TEXT,
+      preview_image_path TEXT,
+      thumbnail_image_url TEXT,
+      thumbnail_image_path TEXT,
       image_content_type TEXT,
       status TEXT NOT NULL,
       usage_json TEXT,
@@ -185,6 +192,10 @@ function ensureColumn(tableName, columnName, definition) {
 function runMigrations() {
   // 兼容已有 SQLite 数据库，避免因为新增字段导致老环境启动失败。
   ensureColumn("generations", "request_json", "TEXT");
+  ensureColumn("generations", "preview_image_url", "TEXT");
+  ensureColumn("generations", "preview_image_path", "TEXT");
+  ensureColumn("generations", "thumbnail_image_url", "TEXT");
+  ensureColumn("generations", "thumbnail_image_path", "TEXT");
   ensureColumn("generation_logs", "updated_at", "TEXT");
   ensureColumn("generation_logs", "job_id", "TEXT");
   ensureColumn("generation_logs", "attempt_count", "INTEGER NOT NULL DEFAULT 0");
@@ -287,6 +298,43 @@ function absoluteStoredPath(storedPath) {
   return storedPath ? path.join(__dirname, storedPath) : null;
 }
 
+function imageAssetRelativePath(username, filename) {
+  return `data/generated-images/${userImageFolderName(username)}/${filename}`;
+}
+
+function imageAssetAbsolutePath(username, filename) {
+  return path.join(__dirname, imageAssetRelativePath(username, filename));
+}
+
+function imageAssetUrl(username, filename) {
+  return `/api/generated-images/${userImageFolderName(username)}/${filename}`;
+}
+
+function buildImageAssetRecord(generationId, username, originalExtension) {
+  const safeExtension = String(originalExtension || "png").replace(/^\./, "") || "png";
+  const originalFilename = `${generationId}.orig.${safeExtension}`;
+  const previewFilename = `${generationId}.preview.webp`;
+  const thumbnailFilename = `${generationId}.thumb.webp`;
+
+  return {
+    originalFilename,
+    previewFilename,
+    thumbnailFilename,
+    originalRelativePath: imageAssetRelativePath(username, originalFilename),
+    previewRelativePath: imageAssetRelativePath(username, previewFilename),
+    thumbnailRelativePath: imageAssetRelativePath(username, thumbnailFilename),
+    originalAbsolutePath: imageAssetAbsolutePath(username, originalFilename),
+    previewAbsolutePath: imageAssetAbsolutePath(username, previewFilename),
+    thumbnailAbsolutePath: imageAssetAbsolutePath(username, thumbnailFilename),
+    previewUrl: imageAssetUrl(username, previewFilename),
+    thumbnailUrl: imageAssetUrl(username, thumbnailFilename),
+  };
+}
+
+function isServableDerivedFilename(filename = "") {
+  return /\.((preview|thumb)\.webp)$/i.test(filename);
+}
+
 async function clearUserImageDir(username) {
   await fs.rm(userImageDir(username), { recursive: true, force: true });
 }
@@ -347,6 +395,8 @@ function requireAdmin(req, res, next) {
 }
 
 function generationFromRow(row) {
+  const previewUrl = row.preview_image_url || row.image_url || null;
+  const thumbnailUrl = row.thumbnail_image_url || previewUrl;
   return {
     id: row.id,
     userId: row.user_id,
@@ -360,10 +410,10 @@ function generationFromRow(row) {
     quality: row.quality,
     count: row.count,
     mode: row.mode,
-    imageUrl: row.image_url,
-    originalImageUrl: row.original_image_url,
-    storedImagePath: row.stored_image_path,
-    imageContentType: row.image_content_type,
+    imageUrl: previewUrl,
+    previewUrl,
+    thumbnailUrl,
+    downloadUrl: `/api/images/history/${row.id}/download`,
     status: row.status,
     usage: parseJsonValue(row.usage_json),
     request: parseJsonValue(row.request_json, {}),
@@ -375,8 +425,9 @@ function saveGeneration(record) {
     INSERT INTO generations (
       id, user_id, created_at, provider_id, adapter_id, model, prompt, revised_prompt,
       size, quality, count, mode, image_url, original_image_url, stored_image_path,
+      preview_image_url, preview_image_path, thumbnail_image_url, thumbnail_image_path,
       image_content_type, status, usage_json, raw_json, request_json
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     record.id,
     record.userId,
@@ -393,6 +444,10 @@ function saveGeneration(record) {
     record.imageUrl,
     record.originalImageUrl,
     record.storedImagePath,
+    record.previewImageUrl,
+    record.previewImagePath,
+    record.thumbnailImageUrl,
+    record.thumbnailImagePath,
     record.imageContentType,
     record.status,
     JSON.stringify(record.usage || null),
@@ -461,24 +516,70 @@ function extensionFromContentType(contentType) {
   return "png";
 }
 
-async function cacheGeneratedImage(id, imageUrl, username) {
-  if (!imageUrl?.startsWith("http")) return null;
+function parseDataUrl(value = "") {
+  const match = /^data:([^;,]+)?(?:;base64)?,([\s\S]+)$/i.exec(value);
+  if (!match) return null;
+  return {
+    contentType: match[1] || "application/octet-stream",
+    buffer: Buffer.from(match[2], "base64"),
+  };
+}
 
-  const response = await fetch(imageUrl);
+async function fetchSourceImagePayload(sourceUrl) {
+  if (!sourceUrl) return null;
+  if (sourceUrl.startsWith("data:")) {
+    return parseDataUrl(sourceUrl);
+  }
+  if (!sourceUrl.startsWith("http://") && !sourceUrl.startsWith("https://")) {
+    return null;
+  }
+
+  const response = await fetch(sourceUrl);
   if (!response.ok) return null;
-
   const contentType = response.headers.get("content-type") || "image/png";
-  const extension = extensionFromContentType(contentType);
-  const filename = `${id}.${extension}`;
-  const targetDir = userImageDir(username);
-  await fs.mkdir(targetDir, { recursive: true });
   const arrayBuffer = await response.arrayBuffer();
-  await fs.writeFile(path.join(targetDir, filename), Buffer.from(arrayBuffer));
-  const folder = userImageFolderName(username);
+  return { contentType, buffer: Buffer.from(arrayBuffer) };
+}
+
+async function writeDerivedImagesFromBuffer(buffer, assets) {
+  await fs.mkdir(path.dirname(assets.originalAbsolutePath), { recursive: true });
+  await sharp(buffer)
+    .resize({
+      width: previewMaxEdge,
+      height: previewMaxEdge,
+      fit: "inside",
+      withoutEnlargement: true,
+    })
+    .webp({ quality: 88 })
+    .toFile(assets.previewAbsolutePath);
+  await sharp(buffer)
+    .resize({
+      width: thumbnailMaxEdge,
+      height: thumbnailMaxEdge,
+      fit: "inside",
+      withoutEnlargement: true,
+    })
+    .webp({ quality: 76 })
+    .toFile(assets.thumbnailAbsolutePath);
+}
+
+async function cacheGeneratedImage(id, sourceUrl, username) {
+  const payload = await fetchSourceImagePayload(sourceUrl);
+  if (!payload?.buffer?.length) return null;
+
+  const contentType = payload.contentType || "image/png";
+  const extension = extensionFromContentType(contentType);
+  const assets = buildImageAssetRecord(id, username, extension);
+  await fs.mkdir(path.dirname(assets.originalAbsolutePath), { recursive: true });
+  await fs.writeFile(assets.originalAbsolutePath, payload.buffer);
+  await writeDerivedImagesFromBuffer(payload.buffer, assets);
 
   return {
-    storedImageUrl: `/api/generated-images/${folder}/${filename}`,
-    storedImagePath: `data/generated-images/${folder}/${filename}`,
+    storedImagePath: assets.originalRelativePath,
+    previewImageUrl: assets.previewUrl,
+    previewImagePath: assets.previewRelativePath,
+    thumbnailImageUrl: assets.thumbnailUrl,
+    thumbnailImagePath: assets.thumbnailRelativePath,
     contentType,
   };
 }
@@ -509,8 +610,79 @@ async function cleanupJobInputFiles(job) {
   await fs.rm(jobInputDir(job.id), { recursive: true, force: true }).catch(() => null);
 }
 
+async function deleteGenerationAssetFiles(row) {
+  await Promise.all(
+    [row.stored_image_path, row.preview_image_path, row.thumbnail_image_path]
+      .filter(Boolean)
+      .map((assetPath) => deleteFileIfExists(absoluteStoredPath(assetPath))),
+  );
+}
+
+function sourceImageUrlFromRow(row) {
+  if (row.original_image_url) return row.original_image_url;
+  if (row.image_url?.startsWith("http://") || row.image_url?.startsWith("https://") || row.image_url?.startsWith("data:")) {
+    return row.image_url;
+  }
+  return null;
+}
+
+async function persistDerivedImageFields(generationId, fields) {
+  db.prepare(`
+    UPDATE generations
+    SET image_url = ?,
+        stored_image_path = ?,
+        preview_image_url = ?,
+        preview_image_path = ?,
+        thumbnail_image_url = ?,
+        thumbnail_image_path = ?,
+        image_content_type = COALESCE(?, image_content_type)
+    WHERE id = ?
+  `).run(
+    fields.previewImageUrl || null,
+    fields.storedImagePath || null,
+    fields.previewImageUrl || null,
+    fields.previewImagePath || null,
+    fields.thumbnailImageUrl || null,
+    fields.thumbnailImagePath || null,
+    fields.contentType || null,
+    generationId,
+  );
+}
+
+async function ensureDerivedImages(row) {
+  const hasPreview = row.preview_image_url && row.preview_image_path;
+  const hasThumb = row.thumbnail_image_url && row.thumbnail_image_path;
+  const hasOriginal = row.stored_image_path && syncFs.existsSync(absoluteStoredPath(row.stored_image_path));
+  if (hasPreview && hasThumb && hasOriginal) return row;
+
+  const user = db.prepare("SELECT username FROM users WHERE id = ?").get(row.user_id);
+  if (!user?.username) return row;
+
+  let fields = null;
+  if (hasOriginal) {
+    const buffer = await fs.readFile(absoluteStoredPath(row.stored_image_path));
+    const extension = path.extname(row.stored_image_path).replace(/^\./, "") || extensionFromContentType(row.image_content_type || "");
+    const assets = buildImageAssetRecord(row.id, user.username, extension);
+    await writeDerivedImagesFromBuffer(buffer, assets);
+    fields = {
+      storedImagePath: row.stored_image_path,
+      previewImageUrl: assets.previewUrl,
+      previewImagePath: assets.previewRelativePath,
+      thumbnailImageUrl: assets.thumbnailUrl,
+      thumbnailImagePath: assets.thumbnailRelativePath,
+      contentType: row.image_content_type || null,
+    };
+  } else {
+    fields = await cacheGeneratedImage(row.id, sourceImageUrlFromRow(row), user.username);
+  }
+
+  if (!fields) return row;
+
+  await persistDerivedImageFields(row.id, fields);
+  return { ...row, image_url: fields.previewImageUrl, stored_image_path: fields.storedImagePath, preview_image_url: fields.previewImageUrl, preview_image_path: fields.previewImagePath, thumbnail_image_url: fields.thumbnailImageUrl, thumbnail_image_path: fields.thumbnailImagePath, image_content_type: fields.contentType || row.image_content_type };
+}
+
 async function moveGenerationImagesToUser(generationRows, targetUser) {
-  const targetFolder = userImageFolderName(targetUser.username);
   const targetDir = userImageDir(targetUser.username);
   await fs.mkdir(targetDir, { recursive: true });
 
@@ -518,34 +690,67 @@ async function moveGenerationImagesToUser(generationRows, targetUser) {
   const updates = [];
 
   for (const row of generationRows) {
-    const currentPath = absoluteStoredPath(row.stored_image_path);
-    const fallbackFilename = `${row.id}.png`;
-    const filename = path.basename(currentPath || row.stored_image_path || fallbackFilename);
-    const nextRelativePath = `data/generated-images/${targetFolder}/${filename}`;
-    const nextApiUrl = `/api/generated-images/${targetFolder}/${filename}`;
-    const nextPath = path.join(__dirname, nextRelativePath);
+    const assetPairs = [
+      ["stored_image_path", "storedImagePath"],
+      ["preview_image_path", "previewImagePath"],
+      ["thumbnail_image_path", "thumbnailImagePath"],
+    ];
+    const nextFields = {};
 
-    if (currentPath && syncFs.existsSync(currentPath)) {
-      if (currentPath !== nextPath) {
-        await safeMoveFile(currentPath, nextPath);
-        movedFiles.push({ fromPath: currentPath, toPath: nextPath });
+    for (const [dbKey, updateKey] of assetPairs) {
+      const currentRelativePath = row[dbKey];
+      if (!currentRelativePath) continue;
+      const currentPath = absoluteStoredPath(currentRelativePath);
+      const filename = path.basename(currentRelativePath);
+      const nextRelativePath = imageAssetRelativePath(targetUser.username, filename);
+      const nextPath = path.join(__dirname, nextRelativePath);
+
+      if (currentPath && syncFs.existsSync(currentPath)) {
+        if (currentPath !== nextPath) {
+          await safeMoveFile(currentPath, nextPath);
+          movedFiles.push({ fromPath: currentPath, toPath: nextPath });
+        }
+      } else {
+        await logServer("generation.transfer_missing_source", {
+          generationId: row.id,
+          asset: dbKey,
+          storedImagePath: currentRelativePath,
+        });
       }
-    } else if (row.stored_image_path) {
-      await logServer("generation.transfer_missing_source", {
-        generationId: row.id,
-        storedImagePath: row.stored_image_path,
-      });
+
+      nextFields[updateKey] = nextRelativePath;
     }
 
-    updates.push({ id: row.id, nextApiUrl, nextRelativePath });
+    updates.push({
+      id: row.id,
+      storedImagePath: nextFields.storedImagePath || null,
+      previewImagePath: nextFields.previewImagePath || null,
+      thumbnailImagePath: nextFields.thumbnailImagePath || null,
+      previewImageUrl: nextFields.previewImagePath ? imageAssetUrl(targetUser.username, path.basename(nextFields.previewImagePath)) : null,
+      thumbnailImageUrl: nextFields.thumbnailImagePath ? imageAssetUrl(targetUser.username, path.basename(nextFields.thumbnailImagePath)) : null,
+    });
   }
 
   db.exec("BEGIN");
   try {
     for (const update of updates) {
-      db.prepare("UPDATE generations SET image_url = ?, stored_image_path = ?, user_id = ? WHERE id = ?").run(
-        update.nextApiUrl,
-        update.nextRelativePath,
+      db.prepare(`
+        UPDATE generations
+        SET image_url = ?,
+            stored_image_path = ?,
+            preview_image_url = ?,
+            preview_image_path = ?,
+            thumbnail_image_url = ?,
+            thumbnail_image_path = ?,
+            user_id = ?
+        WHERE id = ?
+      `).run(
+        update.previewImageUrl,
+        update.storedImagePath,
+        update.previewImageUrl,
+        update.previewImagePath,
+        update.thumbnailImageUrl,
+        update.thumbnailImagePath,
         targetUser.id,
         update.id,
       );
@@ -801,7 +1006,7 @@ async function executeJob(job) {
 
   let cachedImage = null;
   try {
-    cachedImage = await cacheGeneratedImage(generationId, parsed.originalImageUrl, user.username);
+    cachedImage = await cacheGeneratedImage(generationId, parsed.originalImageUrl || parsed.imageUrl, user.username);
   } catch {
     cachedImage = null;
   }
@@ -830,9 +1035,13 @@ async function executeJob(job) {
     quality: request.quality,
     count: request.count,
     mode: request.mode,
-    imageUrl: cachedImage?.storedImageUrl || parsed.imageUrl,
+    imageUrl: cachedImage?.previewImageUrl || parsed.imageUrl,
     originalImageUrl: parsed.originalImageUrl,
     storedImagePath: cachedImage?.storedImagePath || null,
+    previewImageUrl: cachedImage?.previewImageUrl || parsed.imageUrl,
+    previewImagePath: cachedImage?.previewImagePath || null,
+    thumbnailImageUrl: cachedImage?.thumbnailImageUrl || parsed.imageUrl,
+    thumbnailImagePath: cachedImage?.thumbnailImagePath || null,
     imageContentType: cachedImage?.contentType || null,
     status: "done",
     usage: parsed.usage,
@@ -973,42 +1182,93 @@ async function recoverIncompleteJobs() {
 
 async function repairStoredGenerationFiles() {
   const rows = db.prepare(`
-    SELECT g.id, g.user_id, g.image_url, g.stored_image_path, u.username
+    SELECT g.id, g.user_id, g.image_url, g.stored_image_path, g.preview_image_path, g.thumbnail_image_path, u.username
     FROM generations g
     JOIN users u ON u.id = g.user_id
     WHERE g.stored_image_path IS NOT NULL AND g.stored_image_path != ''
   `).all();
 
   for (const row of rows) {
-    // 修复“数据库归属已经变了，但图片还躺在旧用户目录”的历史脏数据。
-    const expectedFolder = userImageFolderName(row.username);
-    const expectedFilename = path.basename(row.stored_image_path);
-    const expectedRelativePath = `data/generated-images/${expectedFolder}/${expectedFilename}`;
-    const expectedApiUrl = `/api/generated-images/${expectedFolder}/${expectedFilename}`;
-    const currentPath = absoluteStoredPath(row.stored_image_path);
-    const expectedPath = path.join(__dirname, expectedRelativePath);
-    const folderMismatch = !row.stored_image_path.includes(`/generated-images/${expectedFolder}/`) && !row.stored_image_path.includes(`\\generated-images\\${expectedFolder}\\`);
-
-    if (!folderMismatch && syncFs.existsSync(expectedPath)) continue;
-    if (!currentPath || !syncFs.existsSync(currentPath)) continue;
+    const assetKeys = [
+      ["stored_image_path", false],
+      ["preview_image_path", true],
+      ["thumbnail_image_path", true],
+    ];
 
     try {
-      await safeMoveFile(currentPath, expectedPath);
-      db.prepare("UPDATE generations SET stored_image_path = ?, image_url = ? WHERE id = ?").run(
-        expectedRelativePath,
-        expectedApiUrl,
-        row.id,
-      );
-      await logServer("generation.repaired_image_path", {
-        generationId: row.id,
-        userId: row.user_id,
-        fromPath: row.stored_image_path,
-        toPath: expectedRelativePath,
-      });
+      const updates = {};
+      for (const [key, isDerived] of assetKeys) {
+        const currentRelativePath = row[key];
+        if (!currentRelativePath) continue;
+        const expectedRelativePath = imageAssetRelativePath(row.username, path.basename(currentRelativePath));
+        const currentPath = absoluteStoredPath(currentRelativePath);
+        const expectedPath = path.join(__dirname, expectedRelativePath);
+        const folderMismatch = !currentRelativePath.includes(`/generated-images/${userImageFolderName(row.username)}/`) && !currentRelativePath.includes(`\\generated-images\\${userImageFolderName(row.username)}\\`);
+
+        if (!folderMismatch && syncFs.existsSync(expectedPath)) {
+          updates[key] = expectedRelativePath;
+          if (isDerived) {
+            updates[key === "preview_image_path" ? "preview_image_url" : "thumbnail_image_url"] = imageAssetUrl(row.username, path.basename(expectedRelativePath));
+          }
+          continue;
+        }
+        if (!currentPath || !syncFs.existsSync(currentPath)) continue;
+        await safeMoveFile(currentPath, expectedPath);
+        updates[key] = expectedRelativePath;
+        if (isDerived) {
+          updates[key === "preview_image_path" ? "preview_image_url" : "thumbnail_image_url"] = imageAssetUrl(row.username, path.basename(expectedRelativePath));
+        }
+      }
+
+      if (Object.keys(updates).length) {
+        db.prepare(`
+          UPDATE generations
+          SET stored_image_path = COALESCE(?, stored_image_path),
+              preview_image_path = COALESCE(?, preview_image_path),
+              preview_image_url = COALESCE(?, preview_image_url),
+              thumbnail_image_path = COALESCE(?, thumbnail_image_path),
+              thumbnail_image_url = COALESCE(?, thumbnail_image_url),
+              image_url = COALESCE(?, image_url)
+          WHERE id = ?
+        `).run(
+          updates.stored_image_path || null,
+          updates.preview_image_path || null,
+          updates.preview_image_url || null,
+          updates.thumbnail_image_path || null,
+          updates.thumbnail_image_url || null,
+          updates.preview_image_url || null,
+          row.id,
+        );
+      }
     } catch (error) {
       await logServer("generation.repair_failed", {
         generationId: row.id,
         error: error?.message || "repair failed",
+      });
+    }
+  }
+}
+
+async function backfillMissingDerivedImages() {
+  const rows = db.prepare(`
+    SELECT *
+    FROM generations
+    WHERE stored_image_path IS NOT NULL
+      AND stored_image_path != ''
+      AND (
+        preview_image_path IS NULL OR preview_image_path = ''
+        OR thumbnail_image_path IS NULL OR thumbnail_image_path = ''
+      )
+    ORDER BY created_at DESC
+  `).all();
+
+  for (const row of rows) {
+    try {
+      await ensureDerivedImages(row);
+    } catch (error) {
+      await logServer("generation.backfill_derived_failed", {
+        generationId: row.id,
+        error: error?.message || "backfill failed",
       });
     }
   }
@@ -1206,7 +1466,11 @@ app.post("/api/admin/generations/transfer", requireAdmin, async (req, res) => {
   if (!fromUser || !toUser) return res.status(404).json({ error: "用户不存在。" });
 
   try {
-    const rows = db.prepare("SELECT id, user_id, image_url, stored_image_path FROM generations WHERE user_id = ?").all(fromUserId);
+    const rows = db.prepare(`
+      SELECT id, user_id, image_url, stored_image_path, preview_image_path, thumbnail_image_path
+      FROM generations
+      WHERE user_id = ?
+    `).all(fromUserId);
     await moveGenerationImagesToUser(rows, toUser);
     res.json({ ok: true, transferred: rows.length });
   } catch (error) {
@@ -1243,7 +1507,7 @@ app.patch("/api/admin/users/:id", requireAdmin, async (req, res) => {
   res.json({ user: sanitizeUser(user) });
 });
 
-app.get("/api/admin/generation-logs", requireAdmin, (req, res) => {
+app.get("/api/admin/generation-logs", requireAdmin, async (req, res) => {
   const filters = [];
   const params = [];
   if (req.query.userId) {
@@ -1267,11 +1531,12 @@ app.get("/api/admin/generation-logs", requireAdmin, (req, res) => {
   const pageSize = Math.min(100, Math.max(1, Number(req.query.pageSize || 30)));
   const where = filters.length ? `WHERE ${filters.join(" AND ")}` : "";
   const total = db.prepare(`SELECT COUNT(*) AS value FROM generation_logs gl ${where}`).get(...params).value;
-  const data = db
+  const rows = db
     .prepare(
       `SELECT gl.id, gl.user_id, gl.username, gl.display_name, gl.created_at, gl.updated_at, gl.provider_id, gl.model, gl.prompt,
               gl.size, gl.quality, gl.count, gl.mode, gl.status, gl.generation_id, gl.job_id, gl.error_message, gl.duration_ms,
-              gl.params_json, gl.attempt_count, COALESCE(gl.image_url, g.image_url) AS image_url
+              gl.params_json, gl.attempt_count, COALESCE(gl.image_url, g.image_url) AS image_url,
+              g.preview_image_url, g.preview_image_path, g.thumbnail_image_url, g.thumbnail_image_path, g.stored_image_path, g.original_image_url
        FROM generation_logs gl
        LEFT JOIN generations g ON g.id = gl.generation_id
        ${where}
@@ -1279,12 +1544,71 @@ app.get("/api/admin/generation-logs", requireAdmin, (req, res) => {
        LIMIT ? OFFSET ?`,
     )
     .all(...params, pageSize, (page - 1) * pageSize);
+  const data = await Promise.all(
+    rows.map(async (row) => {
+      let derived = null;
+      if (row.generation_id) {
+        derived = await ensureDerivedImages({
+          id: row.generation_id,
+          user_id: row.user_id,
+          image_url: row.image_url,
+          preview_image_url: row.preview_image_url,
+          preview_image_path: row.preview_image_path,
+          thumbnail_image_url: row.thumbnail_image_url,
+          thumbnail_image_path: row.thumbnail_image_path,
+          stored_image_path: row.stored_image_path,
+          original_image_url: row.original_image_url,
+          image_content_type: null,
+        }).catch(() => null);
+      }
+      const previewUrl = derived?.preview_image_url || row.preview_image_url || row.image_url || null;
+      const thumbnailUrl = derived?.thumbnail_image_url || row.thumbnail_image_url || previewUrl;
+      return {
+        id: row.id,
+        user_id: row.user_id,
+        username: row.username,
+        display_name: row.display_name,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+        provider_id: row.provider_id,
+        model: row.model,
+        prompt: row.prompt,
+        size: row.size,
+        quality: row.quality,
+        count: row.count,
+        mode: row.mode,
+        status: row.status,
+        error_message: row.error_message,
+        duration_ms: row.duration_ms,
+        attempt_count: row.attempt_count,
+        image_url: previewUrl,
+        thumbnail_url: thumbnailUrl,
+      };
+    }),
+  );
   res.json({ data, page, pageSize, total });
 });
 
-app.get("/api/images/history", requireUser, (req, res) => {
+app.get("/api/images/history", requireUser, async (req, res) => {
   const rows = db.prepare("SELECT * FROM generations WHERE user_id = ? ORDER BY created_at DESC LIMIT 100").all(req.auth.user.id);
-  res.json({ data: rows.map(generationFromRow) });
+  const data = await Promise.all(rows.map((row) => ensureDerivedImages(row).catch(() => row)));
+  res.json({ data: data.map(generationFromRow) });
+});
+
+app.get("/api/images/history/:id/download", requireUser, async (req, res) => {
+  const row = db.prepare("SELECT * FROM generations WHERE id = ? AND user_id = ?").get(req.params.id, req.auth.user.id);
+  if (!row) return res.status(404).json({ error: "历史记录不存在。" });
+
+  const hydrated = await ensureDerivedImages(row).catch(() => row);
+  const absolutePath = absoluteStoredPath(hydrated.stored_image_path);
+  if (!absolutePath || !syncFs.existsSync(absolutePath)) {
+    return res.status(404).json({ error: "原图不存在或已丢失。" });
+  }
+
+  res.setHeader("Content-Type", hydrated.image_content_type || "application/octet-stream");
+  res.setHeader("Content-Disposition", `attachment; filename=\"panghu-image-${req.params.id}${path.extname(absolutePath) || ".png"}\"`);
+  res.setHeader("Cache-Control", "private, no-store");
+  res.sendFile(absolutePath);
 });
 
 app.delete("/api/images/history/:id", requireUser, async (req, res) => {
@@ -1292,10 +1616,8 @@ app.delete("/api/images/history/:id", requireUser, async (req, res) => {
   if (!row) return res.status(404).json({ error: "历史记录不存在。" });
 
   db.prepare("DELETE FROM generations WHERE id = ?").run(row.id);
-  const absolutePath = absoluteStoredPath(row.stored_image_path);
-  if (absolutePath && syncFs.existsSync(absolutePath)) {
-    await fs.rm(absolutePath, { force: true }).catch(() => null);
-  } else if (row.stored_image_path) {
+  await deleteGenerationAssetFiles(row);
+  if (row.stored_image_path && !row.preview_image_path && !row.thumbnail_image_path) {
     await logServer("generation.history_delete_missing_file", {
       generationId: row.id,
       storedImagePath: row.stored_image_path,
@@ -1304,6 +1626,14 @@ app.delete("/api/images/history/:id", requireUser, async (req, res) => {
   }
 
   res.json({ ok: true });
+});
+
+app.use("/api/generated-images", (req, res, next) => {
+  if (!isServableDerivedFilename(path.basename(req.path || ""))) {
+    return res.status(404).json({ error: "图片不存在。" });
+  }
+  res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+  next();
 });
 
 app.use("/api/generated-images", express.static(generatedImagesDir));
@@ -1461,6 +1791,7 @@ app.get(/.*/, (req, res) => {
 
 await recoverIncompleteJobs();
 await repairStoredGenerationFiles();
+void backfillMissingDerivedImages();
 void scheduleWorkers();
 
 const server = app.listen(port, () => {

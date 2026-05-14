@@ -310,7 +310,10 @@ function buildHistoryItem(result, request) {
     quality: result.quality || request.quality,
     count: result.count || request.count,
     mode: result.mode || request.mode,
-    imageUrl: result.imageUrl,
+    imageUrl: result.imageUrl || result.previewUrl || null,
+    previewUrl: result.previewUrl || result.imageUrl || null,
+    thumbnailUrl: result.thumbnailUrl || result.previewUrl || result.imageUrl || null,
+    downloadUrl: result.downloadUrl || (result.id ? `/api/images/history/${result.id}/download` : null),
     status: result.status || "done",
     usage: result.usage || null,
     request: result.request || null,
@@ -528,7 +531,9 @@ function renderApp() {
                   </div>
                 `
                 : item
-                  ? `<img src="${escapeHtml(item.imageUrl)}" alt="${escapeHtml(item.prompt)}" data-action="fullscreen" />`
+                  ? item.previewUrl
+                    ? `<img src="${escapeHtml(item.previewUrl)}" alt="${escapeHtml(item.prompt)}" data-action="fullscreen" />`
+                    : `<div class="empty-state"><i data-lucide="image-plus"></i><strong>图片缺失</strong><span>当前仅找到了历史记录，展示图不可用。</span></div>`
                   : state.mode === "edit" && state.editFiles.length
                     ? editPreviewStage()
                     : `<div class="empty-state"><i data-lucide="image-plus"></i><strong>${user ? (state.mode === "edit" ? "上传参考图开始编辑" : "暂无图片") : "请先登录"}</strong><span>${user ? (state.mode === "edit" ? "支持多张参考图，上传后可继续输入修改描述" : "输入提示词，创造属于你的图片") : "登录后即可生成图片并查看个人历史"}</span></div>`
@@ -576,7 +581,11 @@ function renderApp() {
                       (historyItem) => `
                         <div class="thumb-card ${historyItem.id === state.selectedId ? "active" : ""}">
                           <button class="thumb history-select" data-history-id="${historyItem.id}" title="${escapeHtml(historyItem.prompt)}">
-                            <img src="${escapeHtml(historyItem.imageUrl)}" alt="${escapeHtml(historyItem.prompt)}" />
+                            ${
+                              historyItem.thumbnailUrl
+                                ? `<img src="${escapeHtml(historyItem.thumbnailUrl)}" alt="${escapeHtml(historyItem.prompt)}" />`
+                                : `<span>图片缺失</span>`
+                            }
                             <span>${formatTime(historyItem.createdAt)}</span>
                             <em class="history-mode">${historyItem.mode === "edit" ? "图生图" : "文生图"}</em>
                           </button>
@@ -815,7 +824,7 @@ function adminLogsHtml() {
                       <span>${escapeHtml(log.model || "-")}</span>
                       <span>${escapeHtml([log.size, log.quality].filter(Boolean).join(" / ") || "-")}</span>
                       <span title="${escapeHtml(log.error_message || "")}">${escapeHtml(`${log.status}${log.attempt_count ? ` · ${log.attempt_count}次` : ""}`)}</span>
-                      <span>${log.image_url ? `<a class="admin-image-link" href="${escapeHtml(log.image_url)}" target="_blank" rel="noreferrer"><img src="${escapeHtml(log.image_url)}" alt="生成图片" /></a>` : `<em class="missing-image">无图</em>`}</span>
+                      <span>${log.thumbnail_url ? `<a class="admin-image-link" href="${escapeHtml(log.image_url || log.thumbnail_url)}" target="_blank" rel="noreferrer"><img src="${escapeHtml(log.thumbnail_url)}" alt="生成图片" /></a>` : `<em class="missing-image">无图</em>`}</span>
                       <span>${escapeHtml(log.prompt || "-")}</span>
                     </div>
                   `,
@@ -1014,7 +1023,12 @@ function handleAppAction(button, event) {
     state.showBackendNotice = false;
     render();
   }
-  if (action === "download-selected") downloadSelectedImage();
+  if (action === "download-selected") {
+    void downloadSelectedImage().catch((error) => {
+      state.apiError = error?.message || "原图下载失败，请稍后重试。";
+      render();
+    });
+  }
   if (action === "fullscreen") openFullscreen(button.src);
   if (action === "logout") logout();
   if (action === "select-edit-images") {
@@ -1080,13 +1094,16 @@ function openFullscreen(src, alt = "") {
 
 async function downloadSelectedImage() {
   const item = selectedItem();
-  if (!item?.imageUrl) return;
+  if (!item?.downloadUrl) return;
 
   const safeTime = formatShanghaiTimestamp(item.createdAt);
-  const sourceUrl = item.imageUrl.startsWith("http") ? `/api/images/proxy?url=${encodeURIComponent(item.imageUrl)}` : item.imageUrl;
-  const response = await fetch(sourceUrl);
+  const response = await fetch(item.downloadUrl, { credentials: "same-origin" });
+  if (!response.ok) {
+    const result = await response.json().catch(() => ({}));
+    throw new Error(result?.error || "原图下载失败，请稍后重试。");
+  }
   const blob = await response.blob();
-  const extension = extensionFromMime(blob.type) || extensionFromImageUrl(item.imageUrl) || "png";
+  const extension = extensionFromMime(blob.type) || extensionFromImageUrl(item.downloadUrl) || "png";
   const filename = `panghu-image-${safeTime}.${extension}`;
 
   if ("showSaveFilePicker" in window) {

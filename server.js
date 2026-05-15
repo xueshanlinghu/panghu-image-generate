@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 import { randomBytes, scrypt as scryptCallback, timingSafeEqual, createHash } from "node:crypto";
 import { promisify } from "node:util";
 import { DatabaseSync } from "node:sqlite";
+import yazl from "yazl";
 import { getGenerationAdapter } from "./server/adapters/index.js";
 
 const scrypt = promisify(scryptCallback);
@@ -46,6 +47,16 @@ app.use(express.json({ limit: "2mb" }));
 
 function nowIso() {
   return new Date().toISOString();
+}
+
+function compactTimestamp(date = new Date()) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  const hour = String(date.getHours()).padStart(2, "0");
+  const minute = String(date.getMinutes()).padStart(2, "0");
+  const second = String(date.getSeconds()).padStart(2, "0");
+  return `${year}${month}${day}-${hour}${minute}${second}`;
 }
 
 function isoAfter(ms) {
@@ -1609,6 +1620,61 @@ app.get("/api/images/history/:id/download", requireUser, async (req, res) => {
   res.setHeader("Content-Disposition", `attachment; filename=\"panghu-image-${req.params.id}${path.extname(absolutePath) || ".png"}\"`);
   res.setHeader("Cache-Control", "private, no-store");
   res.sendFile(absolutePath);
+});
+
+app.post("/api/images/history/download-archive", requireUser, async (req, res) => {
+  const rawIds = Array.isArray(req.body?.ids) ? req.body.ids : [];
+  const ids = [...new Set(rawIds.map((id) => String(id || "").trim()).filter(Boolean))];
+  if (!ids.length) {
+    return res.status(400).json({ error: "请至少选择一张历史图片。" });
+  }
+  if (ids.length > 100) {
+    return res.status(400).json({ error: "一次最多只能打包下载 100 张图片。" });
+  }
+
+  const placeholders = ids.map(() => "?").join(", ");
+  const rows = db
+    .prepare(`SELECT * FROM generations WHERE user_id = ? AND id IN (${placeholders}) ORDER BY created_at DESC`)
+    .all(req.auth.user.id, ...ids);
+
+  if (!rows.length) {
+    return res.status(404).json({ error: "未找到可下载的历史图片。" });
+  }
+
+  const archiveEntries = [];
+  for (const row of rows) {
+    // eslint-disable-next-line no-await-in-loop
+    const hydrated = await ensureDerivedImages(row).catch(() => row);
+    const absolutePath = absoluteStoredPath(hydrated.stored_image_path);
+    if (!absolutePath || !syncFs.existsSync(absolutePath)) continue;
+    archiveEntries.push({ row: hydrated, absolutePath });
+  }
+
+  if (!archiveEntries.length) {
+    return res.status(404).json({ error: "所选原图不存在或已丢失。" });
+  }
+
+  const zipFile = new yazl.ZipFile();
+  archiveEntries.forEach(({ row, absolutePath }, index) => {
+    const extension = path.extname(absolutePath) || ".png";
+    const entryName = `panghu-image-${compactTimestamp(new Date(row.created_at))}-${String(index + 1).padStart(2, "0")}${extension}`;
+    zipFile.addFile(absolutePath, entryName);
+  });
+
+  res.setHeader("Content-Type", "application/zip");
+  res.setHeader("Content-Disposition", `attachment; filename="panghu-images-${compactTimestamp()}.zip"`);
+  res.setHeader("Cache-Control", "private, no-store");
+
+  zipFile.outputStream.on("error", () => {
+    if (!res.headersSent) {
+      res.status(500).json({ error: "打包下载失败，请稍后重试。" });
+    } else {
+      res.destroy();
+    }
+  });
+
+  zipFile.outputStream.pipe(res);
+  zipFile.end();
 });
 
 app.delete("/api/images/history/:id", requireUser, async (req, res) => {

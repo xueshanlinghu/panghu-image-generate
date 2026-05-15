@@ -1193,25 +1193,23 @@ async function handleMobileAction(action, payload = {}) {
   }
   if (action === "batch-download") {
     if (!state.mobileUI.selectedHistoryIds.length || state.mobileUI.batchActionText) return;
-    let successCount = 0;
-    let failedCount = 0;
     state.mobileUI.batchActionText = `正在下载 ${state.mobileUI.selectedHistoryIds.length} 张作品`;
     render();
-    for (const historyId of state.mobileUI.selectedHistoryIds) {
-      // 顺序下载可以减少浏览器一次性弹出多个下载的失败概率。
-      // eslint-disable-next-line no-await-in-loop
-      await downloadHistoryItemById(historyId)
-        .then(() => {
-          successCount += 1;
-        })
-        .catch(() => {
-          failedCount += 1;
-        });
+    try {
+      if (state.mobileUI.selectedHistoryIds.length === 1) {
+        await downloadHistoryItemById(state.mobileUI.selectedHistoryIds[0]);
+        showMobileToast("作品已开始下载");
+      } else {
+        await downloadHistoryArchive(state.mobileUI.selectedHistoryIds);
+        showMobileToast(`已打包 ${state.mobileUI.selectedHistoryIds.length} 张作品`);
+      }
+      state.apiError = "";
+    } catch (error) {
+      state.apiError = error?.message || "批量打包下载失败，请稍后重试。";
+    } finally {
+      state.mobileUI.batchActionText = "";
+      render();
     }
-    state.mobileUI.batchActionText = "";
-    state.apiError = failedCount ? `${failedCount} 张作品下载失败，请稍后重试。` : "";
-    render();
-    showMobileToast(successCount ? `已处理 ${successCount} 张作品下载` : "没有可下载的作品");
     return;
   }
   if (action === "batch-delete") {
@@ -1418,12 +1416,35 @@ async function downloadHistoryItem(item) {
   const blob = await response.blob();
   const extension = extensionFromMime(blob.type) || extensionFromImageUrl(item.downloadUrl) || "png";
   const filename = `panghu-image-${safeTime}.${extension}`;
+  await saveBlobWithPicker(blob, filename, [{ description: "图片文件", accept: { "image/png": [".png"], "image/jpeg": [".jpg", ".jpeg"], "image/webp": [".webp"], "image/svg+xml": [".svg"] } }]);
+}
 
+async function downloadHistoryArchive(historyIds) {
+  if (!historyIds.length) return;
+  const response = await fetch("/api/images/history/download-archive", {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ids: historyIds }),
+  });
+  if (!response.ok) {
+    const result = await response.json().catch(() => ({}));
+    throw new Error(result?.error || "批量打包下载失败，请稍后重试。");
+  }
+
+  const blob = await response.blob();
+  const disposition = response.headers.get("content-disposition") || "";
+  const filenameMatch = disposition.match(/filename="([^"]+)"/i);
+  const filename = filenameMatch?.[1] || `panghu-images-${formatShanghaiTimestamp(new Date().toISOString())}.zip`;
+  await saveBlobWithPicker(blob, filename, [{ description: "压缩包", accept: { "application/zip": [".zip"] } }]);
+}
+
+async function saveBlobWithPicker(blob, filename, fileTypes) {
   if ("showSaveFilePicker" in window) {
     try {
       const handle = await window.showSaveFilePicker({
         suggestedName: filename,
-        types: [{ description: "图片文件", accept: { "image/png": [".png"], "image/jpeg": [".jpg", ".jpeg"], "image/webp": [".webp"], "image/svg+xml": [".svg"] } }],
+        types: fileTypes,
       });
       const writable = await handle.createWritable();
       await writable.write(blob);

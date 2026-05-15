@@ -408,6 +408,7 @@ function requireAdmin(req, res, next) {
 function generationFromRow(row) {
   const previewUrl = row.preview_image_url || row.image_url || null;
   const thumbnailUrl = row.thumbnail_image_url || previewUrl;
+  const inlineUrl = `/api/images/history/${row.id}/download?disposition=inline`;
   return {
     id: row.id,
     userId: row.user_id,
@@ -425,10 +426,16 @@ function generationFromRow(row) {
     previewUrl,
     thumbnailUrl,
     downloadUrl: `/api/images/history/${row.id}/download`,
+    inlineUrl,
     status: row.status,
     usage: parseJsonValue(row.usage_json),
     request: parseJsonValue(row.request_json, {}),
   };
+}
+
+function historyImageFilename(row, absolutePath) {
+  const extension = path.extname(absolutePath) || ".png";
+  return `panghu-image-${compactTimestamp(new Date(row.created_at))}${extension}`;
 }
 
 function saveGeneration(record) {
@@ -1616,10 +1623,50 @@ app.get("/api/images/history/:id/download", requireUser, async (req, res) => {
     return res.status(404).json({ error: "原图不存在或已丢失。" });
   }
 
+  const disposition = String(req.query?.disposition || "attachment").toLowerCase() === "inline" ? "inline" : "attachment";
+  const filename = historyImageFilename(hydrated, absolutePath);
   res.setHeader("Content-Type", hydrated.image_content_type || "application/octet-stream");
-  res.setHeader("Content-Disposition", `attachment; filename=\"panghu-image-${req.params.id}${path.extname(absolutePath) || ".png"}\"`);
+  res.setHeader("Content-Disposition", `${disposition}; filename="${filename}"`);
   res.setHeader("Cache-Control", "private, no-store");
   res.sendFile(absolutePath);
+});
+
+app.post("/api/images/history/mobile-save-manifest", requireUser, async (req, res) => {
+  const rawIds = Array.isArray(req.body?.ids) ? req.body.ids : [];
+  const ids = [...new Set(rawIds.map((id) => String(id || "").trim()).filter(Boolean))];
+  if (!ids.length) {
+    return res.status(400).json({ error: "请至少选择一张历史图片。" });
+  }
+  if (ids.length > 100) {
+    return res.status(400).json({ error: "一次最多只能处理 100 张图片。" });
+  }
+
+  const placeholders = ids.map(() => "?").join(", ");
+  const rows = db
+    .prepare(`SELECT * FROM generations WHERE user_id = ? AND id IN (${placeholders}) ORDER BY created_at DESC`)
+    .all(req.auth.user.id, ...ids);
+
+  const items = [];
+  for (const row of rows) {
+    // eslint-disable-next-line no-await-in-loop
+    const hydrated = await ensureDerivedImages(row).catch(() => row);
+    const absolutePath = absoluteStoredPath(hydrated.stored_image_path);
+    if (!absolutePath || !syncFs.existsSync(absolutePath)) continue;
+    items.push({
+      id: hydrated.id,
+      createdAt: hydrated.created_at,
+      filename: historyImageFilename(hydrated, absolutePath),
+      contentType: hydrated.image_content_type || "application/octet-stream",
+      inlineUrl: `/api/images/history/${hydrated.id}/download?disposition=inline`,
+      downloadUrl: `/api/images/history/${hydrated.id}/download`,
+    });
+  }
+
+  if (!items.length) {
+    return res.status(404).json({ error: "所选原图不存在或已丢失。" });
+  }
+
+  res.json({ data: items });
 });
 
 app.post("/api/images/history/download-archive", requireUser, async (req, res) => {

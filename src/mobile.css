@@ -328,6 +328,16 @@ body.is-mobile-app {
   text-decoration: none;
 }
 
+.mobile-save-tip {
+  padding: 10px 12px;
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--mobile-surface) 88%, transparent);
+  color: var(--mobile-muted);
+  font-size: 12px;
+  line-height: 1.5;
+  text-align: center;
+}
+
 .mobile-pill-button.primary,
 .mobile-generate-button {
   background: var(--mobile-accent);
@@ -772,7 +782,7 @@ body.is-mobile-app {
   bottom: calc(10px + var(--mobile-safe-bottom));
   z-index: 16;
   display: grid;
-  grid-template-columns: 1fr auto auto;
+  grid-template-columns: 1fr auto;
   align-items: center;
   gap: 12px;
   min-height: 68px;

@@ -67,10 +67,13 @@ const state = {
     composerOpen: false,
     activeSetting: "",
     subroute: "feed",
+    detailReturnSubroute: "feed",
     managingHistory: false,
     selectedHistoryIds: [],
     toast: "",
     batchActionText: "",
+    saveItems: [],
+    saveReturnSubroute: "history",
   },
   admin: {
     ready: false,
@@ -109,6 +112,11 @@ function resetMobileHistorySelection() {
   state.mobileUI.managingHistory = false;
   state.mobileUI.selectedHistoryIds = [];
   state.mobileUI.batchActionText = "";
+}
+
+function resetMobileSaveState() {
+  state.mobileUI.saveItems = [];
+  state.mobileUI.saveReturnSubroute = "history";
 }
 
 function showMobileToast(message) {
@@ -364,6 +372,7 @@ function buildHistoryItem(result, request) {
     previewUrl: result.previewUrl || result.imageUrl || null,
     thumbnailUrl: result.thumbnailUrl || result.previewUrl || result.imageUrl || null,
     downloadUrl: result.downloadUrl || (result.id ? `/api/images/history/${result.id}/download` : null),
+    inlineUrl: result.inlineUrl || (result.id ? `/api/images/history/${result.id}/download?disposition=inline` : null),
     status: result.status || "done",
     usage: result.usage || null,
     request: result.request || null,
@@ -1021,6 +1030,8 @@ async function submitUserLogin(formData) {
     state.history = [];
     state.selectedId = null;
     state.mobileUI.loginOpen = false;
+    resetMobileSaveState();
+    resetMobileHistorySelection();
     await loadStoredHistory();
     if (state.route === "login") {
       routeTo("/");
@@ -1078,7 +1089,6 @@ async function handleMobileAction(action, payload = {}) {
     "edit-again",
     "toggle-history-manage",
     "toggle-history-select",
-    "batch-download",
     "batch-delete",
   ]);
 
@@ -1105,23 +1115,34 @@ async function handleMobileAction(action, payload = {}) {
   }
   if (action === "open-history") {
     state.mobileUI.subroute = "history";
+    state.mobileUI.detailReturnSubroute = "feed";
+    resetMobileSaveState();
     resetMobileHistorySelection();
     render();
     return;
   }
   if (action === "open-feed") {
     state.mobileUI.subroute = "feed";
+    state.mobileUI.detailReturnSubroute = "feed";
+    resetMobileSaveState();
     resetMobileHistorySelection();
     render();
     return;
   }
+  if (action === "save-back") {
+    state.mobileUI.subroute = state.mobileUI.saveReturnSubroute || (state.history.length ? "history" : "feed");
+    resetMobileSaveState();
+    render();
+    return;
+  }
   if (action === "detail-back") {
-    state.mobileUI.subroute = "history";
+    state.mobileUI.subroute = state.mobileUI.detailReturnSubroute || "feed";
     render();
     return;
   }
   if (action === "open-detail") {
     state.selectedId = payload.historyId || state.selectedId;
+    state.mobileUI.detailReturnSubroute = state.mobileUI.subroute === "history" ? "history" : "feed";
     state.mobileUI.subroute = "detail";
     render();
     return;
@@ -1191,6 +1212,35 @@ async function handleMobileAction(action, payload = {}) {
     });
     return;
   }
+  if (action === "save-manifest-item" && payload.historyId) {
+    const saveItem = state.mobileUI.saveItems.find((entry) => entry.id === payload.historyId);
+    if (!saveItem) return;
+    if (isWeChatBrowser()) {
+      showMobileToast("请长按图片保存到相册");
+      return;
+    }
+    if (!isWeChatBrowser() && triggerBrowserDownload(saveItem.downloadUrl, `panghu-image-${formatShanghaiTimestamp(saveItem.createdAt || new Date().toISOString())}`)) {
+      showMobileToast("已尝试通过浏览器下载，如未成功请长按图片保存");
+      return;
+    }
+    if (!isWeChatBrowser() && mobileFileShareSupported()) {
+      try {
+        const file = createImageFile(await fetchHistoryBlob(saveItem), saveItem);
+        const shareResult = await shareFilesToSystem([file]);
+        if (shareResult.status === "shared") {
+          showMobileToast("已打开系统分享，请选择保存到相册");
+          return;
+        }
+        if (shareResult.status === "cancelled") return;
+      } catch (error) {
+        state.apiError = error?.message || "保存到相册失败，请稍后重试。";
+        render();
+        return;
+      }
+    }
+    showMobileToast("请长按图片保存到相册");
+    return;
+  }
   if (action === "copy-prompt") {
     const item = state.history.find((entry) => entry.id === payload.historyId);
     if (item?.prompt) {
@@ -1223,27 +1273,6 @@ async function handleMobileAction(action, payload = {}) {
       state.mobileUI.selectedHistoryIds = [...state.mobileUI.selectedHistoryIds, payload.historyId];
     }
     render();
-    return;
-  }
-  if (action === "batch-download") {
-    if (!state.mobileUI.selectedHistoryIds.length || state.mobileUI.batchActionText) return;
-    state.mobileUI.batchActionText = `正在下载 ${state.mobileUI.selectedHistoryIds.length} 张作品`;
-    render();
-    try {
-      if (state.mobileUI.selectedHistoryIds.length === 1) {
-        await downloadHistoryItemById(state.mobileUI.selectedHistoryIds[0]);
-        showMobileToast("作品已开始下载");
-      } else {
-        await downloadHistoryArchive(state.mobileUI.selectedHistoryIds);
-        showMobileToast(`已打包 ${state.mobileUI.selectedHistoryIds.length} 张作品`);
-      }
-      state.apiError = "";
-    } catch (error) {
-      state.apiError = error?.message || "批量打包下载失败，请稍后重试。";
-    } finally {
-      state.mobileUI.batchActionText = "";
-      render();
-    }
     return;
   }
   if (action === "batch-delete") {
@@ -1441,6 +1470,11 @@ async function downloadHistoryItemById(historyId) {
 
 async function downloadHistoryItem(item) {
   if (!item?.downloadUrl) return;
+  if (isMobileAppViewport()) {
+    await saveHistoryItemToMobileAlbum(item);
+    return;
+  }
+
   const safeTime = formatShanghaiTimestamp(item.createdAt);
   const response = await fetch(item.downloadUrl, { credentials: "same-origin" });
   if (!response.ok) {
@@ -1451,6 +1485,119 @@ async function downloadHistoryItem(item) {
   const extension = extensionFromMime(blob.type) || extensionFromImageUrl(item.downloadUrl) || "png";
   const filename = `panghu-image-${safeTime}.${extension}`;
   await saveBlobWithPicker(blob, filename, [{ description: "图片文件", accept: { "image/png": [".png"], "image/jpeg": [".jpg", ".jpeg"], "image/webp": [".webp"], "image/svg+xml": [".svg"] } }]);
+}
+
+function mobileFileShareSupported() {
+  return Boolean(window.isSecureContext && navigator.share && navigator.canShare);
+}
+
+function isWeChatBrowser() {
+  return /MicroMessenger/i.test(navigator.userAgent || "");
+}
+
+function inlineHistoryUrl(item) {
+  if (item?.inlineUrl) return item.inlineUrl;
+  if (!item?.downloadUrl) return "";
+  return item.downloadUrl.includes("?") ? `${item.downloadUrl}&disposition=inline` : `${item.downloadUrl}?disposition=inline`;
+}
+
+function triggerBrowserDownload(url, filename = "") {
+  if (!url) return false;
+  const link = document.createElement("a");
+  link.href = url;
+  if (filename) link.download = filename;
+  link.rel = "noopener";
+  link.style.display = "none";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  return true;
+}
+
+function mobileSaveItemFromHistory(item) {
+  return {
+    id: item.id,
+    createdAt: item.createdAt,
+    inlineUrl: inlineHistoryUrl(item),
+    downloadUrl: item.downloadUrl,
+  };
+}
+
+function mobileSaveItemsFromHistoryIds(historyIds) {
+  return historyIds
+    .map((historyId) => state.history.find((entry) => entry.id === historyId))
+    .filter(Boolean)
+    .map((item) => mobileSaveItemFromHistory(item));
+}
+
+async function fetchHistoryBlob(item) {
+  const response = await fetch(inlineHistoryUrl(item), { credentials: "same-origin" });
+  if (!response.ok) {
+    const result = await response.json().catch(() => ({}));
+    throw new Error(result?.error || "原图获取失败，请稍后重试。");
+  }
+  return response.blob();
+}
+
+function createImageFile(blob, item) {
+  const safeTime = formatShanghaiTimestamp(item.createdAt || new Date().toISOString());
+  const extension = extensionFromMime(blob.type) || extensionFromImageUrl(item.downloadUrl || item.inlineUrl || "") || "png";
+  const filename = `panghu-image-${safeTime}.${extension}`;
+  return new File([blob], filename, { type: blob.type || "image/png", lastModified: Date.now() });
+}
+
+async function shareFilesToSystem(files, { title = "胖狐生图", text = "请选择保存到相册" } = {}) {
+  if (!mobileFileShareSupported()) return { status: "unsupported" };
+  if (!navigator.canShare({ files })) return { status: "unsupported" };
+
+  try {
+    await navigator.share({ files, title, text });
+    return { status: "shared" };
+  } catch (error) {
+    if (error?.name === "AbortError") return { status: "cancelled" };
+    if (error?.name === "TypeError" || error?.name === "NotAllowedError" || error?.name === "DataError") {
+      return { status: "unsupported" };
+    }
+    return { status: "failed", error };
+  }
+}
+
+function openMobileSavePage(items, returnSubroute = state.mobileUI.subroute || "history") {
+  state.mobileUI.saveItems = items;
+  state.mobileUI.saveReturnSubroute = returnSubroute;
+  state.mobileUI.managingHistory = false;
+  state.mobileUI.selectedHistoryIds = [];
+  state.mobileUI.batchActionText = "";
+  state.mobileUI.subroute = "save";
+  render();
+}
+
+async function saveHistoryItemToMobileAlbum(item) {
+  const mobileItem = mobileSaveItemFromHistory(item);
+
+  if (!isWeChatBrowser()) {
+    const filename = `panghu-image-${formatShanghaiTimestamp(item.createdAt || new Date().toISOString())}`;
+    if (triggerBrowserDownload(item.downloadUrl, filename)) {
+      showMobileToast("已尝试通过浏览器下载，如未成功请长按图片保存");
+      return;
+    }
+  }
+
+  if (!isWeChatBrowser() && mobileFileShareSupported()) {
+    const blob = await fetchHistoryBlob(mobileItem);
+    const shareResult = await shareFilesToSystem([createImageFile(blob, mobileItem)]);
+    if (shareResult.status === "shared") {
+      showMobileToast("已打开系统分享，请选择保存到相册");
+      return;
+    }
+    if (shareResult.status === "cancelled") return;
+    if (shareResult.status === "failed") {
+      throw shareResult.error || new Error("保存到相册失败，请稍后重试。");
+    }
+  }
+
+  openMobileSavePage([mobileItem], state.mobileUI.subroute);
+  showMobileToast(isWeChatBrowser() ? "如未出现保存选项，请长按图片保存" : "请长按图片保存到相册");
 }
 
 async function downloadHistoryArchive(historyIds) {
@@ -1471,6 +1618,24 @@ async function downloadHistoryArchive(historyIds) {
   const filenameMatch = disposition.match(/filename="([^"]+)"/i);
   const filename = filenameMatch?.[1] || `panghu-images-${formatShanghaiTimestamp(new Date().toISOString())}.zip`;
   await saveBlobWithPicker(blob, filename, [{ description: "压缩包", accept: { "application/zip": [".zip"] } }]);
+}
+
+async function loadMobileSaveManifest(historyIds) {
+  const result = await apiJson("/api/images/history/mobile-save-manifest", {
+    method: "POST",
+    body: JSON.stringify({ ids: historyIds }),
+  });
+  return Array.isArray(result?.data) ? result.data : [];
+}
+
+async function createShareableImageFiles(items) {
+  const files = [];
+  for (const item of items) {
+    // eslint-disable-next-line no-await-in-loop
+    const blob = await fetchHistoryBlob(item);
+    files.push(createImageFile(blob, item));
+  }
+  return files;
 }
 
 async function saveBlobWithPicker(blob, filename, fileTypes) {
@@ -1665,6 +1830,7 @@ async function logout() {
   state.mobileUI.composerOpen = false;
   state.mobileUI.activeSetting = "";
   state.mobileUI.subroute = "feed";
+  resetMobileSaveState();
   resetMobileHistorySelection();
   render();
 }

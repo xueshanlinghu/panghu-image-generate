@@ -134,7 +134,7 @@ function feedCard(item, { selectedId }) {
       </button>
       <div class="mobile-feed-actions">
         <button class="mobile-pill-button" data-mobile-action="edit-again" data-history-id="${item.id}">沿用参数</button>
-        <button class="mobile-pill-button primary" data-mobile-action="download-history" data-history-id="${item.id}">下载原图</button>
+        <button class="mobile-pill-button primary" data-mobile-action="download-history" data-history-id="${item.id}">保存到相册</button>
         <div class="mobile-badge-row mobile-feed-meta-row">
           <span class="mobile-badge">${escapeHtml(badgeText(item.mode))}</span>
           <span class="mobile-badge">${escapeHtml(sizePreset.badge)}</span>
@@ -169,6 +169,45 @@ function historyGrid(items, { mobileUI }) {
   `;
 }
 
+function saveHintText() {
+  return /MicroMessenger/i.test(navigator.userAgent || "") ? "如未出现保存选项，请长按图片保存到相册" : "长按图片可保存到相册，也可点下方按钮尝试系统分享";
+}
+
+function mobileSavePanel(items) {
+  const isWeChat = /MicroMessenger/i.test(navigator.userAgent || "");
+  return `
+    <section class="mobile-save-panel">
+      <div class="mobile-save-copy">
+        <strong>保存到相册</strong>
+        <span>${escapeHtml(saveHintText())}</span>
+      </div>
+      <div class="mobile-save-list">
+        ${items
+          .map(
+            (item) => `
+              <article class="mobile-save-card">
+                <div class="mobile-save-image">
+                  <img src="${escapeHtml(item.inlineUrl)}" alt="待保存原图" />
+                </div>
+                ${
+                  isWeChat
+                    ? `<div class="mobile-save-tip">长按上方图片保存到相册</div>`
+                    : `
+                      <div class="mobile-save-actions">
+                        <button class="mobile-pill-button primary" type="button" data-mobile-action="save-manifest-item" data-history-id="${item.id}">保存这张</button>
+                        <a class="mobile-pill-button" href="${escapeHtml(item.inlineUrl)}" target="_blank" rel="noreferrer">打开原图</a>
+                      </div>
+                    `
+                }
+              </article>
+            `,
+          )
+          .join("")}
+      </div>
+    </section>
+  `;
+}
+
 function detailPanel(item, { formatDateTime }) {
   if (!item) {
     return emptyState({ title: "未找到作品", description: "请返回作品列表后重新选择。" });
@@ -193,7 +232,7 @@ function detailPanel(item, { formatDateTime }) {
         <span>${escapeHtml(displayTime)}</span>
       </div>
       <div class="mobile-detail-actions">
-        <button class="mobile-pill-button primary" data-mobile-action="download-history" data-history-id="${item.id}">下载原图</button>
+        <button class="mobile-pill-button primary" data-mobile-action="download-history" data-history-id="${item.id}">保存到相册</button>
         <button class="mobile-pill-button" data-mobile-action="edit-again" data-history-id="${item.id}">沿用参数</button>
         <button class="mobile-pill-button" data-mobile-action="copy-prompt" data-history-id="${item.id}">复制提示词</button>
       </div>
@@ -422,12 +461,21 @@ export function renderMobileApp({ state, selectedItem, formatDateTime }) {
               <i data-lucide="chevron-left"></i>
             </button>
             <strong>作品</strong>
-            <button class="mobile-icon-button" type="button" data-mobile-action="open-history" aria-label="查看历史作品">
-              <i data-lucide="history"></i>
-            </button>
+            <span></span>
           </div>
           ${detailPanel(selectedItem, { formatDateTime })}
         `
+        : subroute === "save"
+          ? `
+            <div class="mobile-page-head">
+              <button class="mobile-icon-button" type="button" data-mobile-action="save-back" aria-label="返回历史作品">
+                <i data-lucide="chevron-left"></i>
+              </button>
+              <strong>保存到相册</strong>
+              <span></span>
+            </div>
+            ${mobileSavePanel(state.mobileUI.saveItems)}
+          `
         : `
           ${state.history.length ? state.history.map((item) => feedCard(item, { selectedId: state.selectedId })).join("") : ""}
           ${
@@ -443,7 +491,6 @@ export function renderMobileApp({ state, selectedItem, formatDateTime }) {
                     className: "mobile-empty-card-emphasis",
                   })
           }
-          ${state.apiError ? `<div class="mobile-inline-error mobile-global-error">${escapeHtml(state.apiError)}</div>` : ""}
         `;
 
   return `
@@ -452,6 +499,7 @@ export function renderMobileApp({ state, selectedItem, formatDateTime }) {
         ${mobileToolbar(state)}
         <div class="mobile-scroll-content ${subroute === "feed" ? "is-feed" : ""}">
           ${bodyContent}
+          ${state.apiError ? `<div class="mobile-inline-error mobile-global-error">${escapeHtml(state.apiError)}</div>` : ""}
         </div>
         ${
           subroute === "feed"
@@ -480,12 +528,8 @@ export function renderMobileApp({ state, selectedItem, formatDateTime }) {
               <div class="mobile-manage-bar">
                 <div class="mobile-manage-copy">
                   <strong>${escapeHtml(state.mobileUI.batchActionText || `已选择 ${state.mobileUI.selectedHistoryIds.length} 张`)}</strong>
-                  <span>${escapeHtml(state.mobileUI.batchActionText ? "请稍候，正在处理" : "可批量下载或删除")}</span>
+                  <span>${escapeHtml(state.mobileUI.batchActionText ? "请稍候，正在处理" : "仅支持批量删除，下载请逐张进入作品页操作")}</span>
                 </div>
-                <button type="button" data-mobile-action="batch-download" ${state.mobileUI.batchActionText ? "disabled" : ""} aria-label="下载已选作品">
-                  <i data-lucide="download"></i>
-                  <span>下载</span>
-                </button>
                 <button type="button" data-mobile-action="batch-delete" ${state.mobileUI.batchActionText ? "disabled" : ""} aria-label="删除已选作品">
                   <i data-lucide="trash-2"></i>
                   <span>删除</span>

@@ -308,10 +308,40 @@ body.is-mobile-app {
   color: #fff;
 }
 
+.mobile-generate-button {
+  display: inline-flex;
+  width: 100%;
+  min-height: 48px;
+  align-items: center;
+  justify-content: center;
+  padding: 0 18px;
+  border: 1px solid transparent;
+  border-radius: 16px;
+  box-shadow: 0 10px 24px color-mix(in srgb, var(--mobile-accent) 24%, transparent);
+  font-size: 15px;
+  font-weight: 800;
+  letter-spacing: 0.01em;
+  transition: transform 160ms ease, box-shadow 160ms ease, background 160ms ease, border-color 160ms ease, opacity 160ms ease;
+}
+
 .mobile-generate-button.secondary {
   background: var(--mobile-panel);
   border-color: var(--mobile-line);
   color: var(--mobile-text);
+  box-shadow: none;
+}
+
+.mobile-generate-button:not(:disabled):active {
+  transform: translateY(1px) scale(0.995);
+}
+
+.mobile-generate-button:disabled {
+  opacity: 0.56;
+}
+
+.mobile-generate-button:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--mobile-accent) 18%, transparent);
 }
 
 .mobile-page-head {

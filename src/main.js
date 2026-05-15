@@ -68,6 +68,7 @@ const state = {
     activeSetting: "",
     subroute: "feed",
     detailReturnSubroute: "feed",
+    feedTransientItems: [],
     managingHistory: false,
     selectedHistoryIds: [],
     toast: "",
@@ -101,6 +102,11 @@ const app = document.querySelector("#app");
 let generationTimer = null;
 let adminRefreshTimer = null;
 let mobileToastTimer = null;
+let lastRenderedMobileSubroute = "";
+let mobileScrollSnapshot = {
+  subroute: "",
+  scrollTop: 0,
+};
 const mobileQuery = window.matchMedia("(max-width: 768px)");
 state.leftCollapsed = mobileQuery.matches;
 
@@ -117,6 +123,10 @@ function resetMobileHistorySelection() {
 function resetMobileSaveState() {
   state.mobileUI.saveItems = [];
   state.mobileUI.saveReturnSubroute = "history";
+}
+
+function resetMobileTransientItems() {
+  state.mobileUI.feedTransientItems = [];
 }
 
 function showMobileToast(message) {
@@ -209,6 +219,19 @@ function restoreFromHistory(item) {
   state.count = item.count ?? 1;
   state.prompt = item.prompt ?? "";
   state.mode = item.mode ?? "generate";
+  normalizeModelState(state);
+  normalizeCount();
+}
+
+function restoreFromRequestSnapshot(snapshot) {
+  if (!snapshot) return;
+  state.providerId = snapshot.providerId ?? "panghu";
+  state.model = snapshot.model ?? "gpt-image-2";
+  state.size = snapshot.size ?? "auto";
+  state.quality = snapshot.quality ?? "auto";
+  state.count = snapshot.count ?? 1;
+  state.prompt = snapshot.prompt ?? "";
+  state.mode = snapshot.mode ?? "generate";
   normalizeModelState(state);
   normalizeCount();
 }
@@ -332,6 +355,64 @@ function buildPreviewFiles(files) {
   }));
 }
 
+function createMobileTransientId(prefix = "mobile-job") {
+  return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+}
+
+function buildMobileTransientItem(request) {
+  return {
+    id: createMobileTransientId(),
+    jobId: "",
+    status: "pending",
+    jobStatus: "queued",
+    attemptCount: 0,
+    createdAt: new Date().toISOString(),
+    prompt: request.prompt,
+    mode: request.mode,
+    size: request.size,
+    quality: request.quality,
+    providerId: request.providerId,
+    model: request.model,
+    requestSnapshot: { ...request },
+    errorMessage: "",
+    referencePreview:
+      request.mode === "edit" && state.editFiles.length
+        ? {
+            url: state.editFiles[0]?.previewUrl || "",
+            count: state.editFiles.length,
+          }
+        : null,
+  };
+}
+
+function upsertMobileTransientItem(nextItem) {
+  state.mobileUI.feedTransientItems = [
+    nextItem,
+    ...state.mobileUI.feedTransientItems.filter((item) => item.id !== nextItem.id),
+  ];
+}
+
+function patchMobileTransientItem(transientId, updater) {
+  state.mobileUI.feedTransientItems = state.mobileUI.feedTransientItems.map((item) => {
+    if (item.id !== transientId) return item;
+    return typeof updater === "function" ? updater(item) : { ...item, ...updater };
+  });
+}
+
+function removeMobileTransientItem(transientId) {
+  state.mobileUI.feedTransientItems = state.mobileUI.feedTransientItems.filter((item) => item.id !== transientId);
+}
+
+function mobileTransientItemById(transientId) {
+  return state.mobileUI.feedTransientItems.find((item) => item.id === transientId) ?? null;
+}
+
+function summarizeTransientError(message) {
+  const text = String(message || "").trim();
+  if (!text) return "生成失败，请稍后重试。";
+  return text.length > 42 ? `${text.slice(0, 42)}...` : text;
+}
+
 function appendEditFiles(fileList) {
   const incoming = Array.from(fileList || []);
   if (!incoming.length) return;
@@ -451,6 +532,15 @@ function promptMetaText() {
 
 function render() {
   const mobileAppActive = state.route === "app" && isMobileAppViewport();
+  if (mobileAppActive) {
+    const scrollNode = app.querySelector(".mobile-scroll-content");
+    if (scrollNode) {
+      mobileScrollSnapshot = {
+        subroute: lastRenderedMobileSubroute || state.mobileUI.subroute,
+        scrollTop: scrollNode.scrollTop,
+      };
+    }
+  }
   document.body.classList.toggle("is-mobile-app", mobileAppActive);
   app.classList.toggle("is-mobile-app", mobileAppActive);
 
@@ -498,6 +588,11 @@ function renderMobileRoot() {
     selectedItem: selectedItem(),
     formatDateTime,
   });
+  const scrollNode = app.querySelector(".mobile-scroll-content");
+  if (scrollNode && mobileScrollSnapshot.subroute === state.mobileUI.subroute) {
+    scrollNode.scrollTop = mobileScrollSnapshot.scrollTop;
+  }
+  lastRenderedMobileSubroute = state.mobileUI.subroute;
   bindMobileEvents();
   applyIcons();
 }
@@ -1032,6 +1127,7 @@ async function submitUserLogin(formData) {
     state.mobileUI.loginOpen = false;
     resetMobileSaveState();
     resetMobileHistorySelection();
+    resetMobileTransientItems();
     await loadStoredHistory();
     if (state.route === "login") {
       routeTo("/");
@@ -1202,6 +1298,7 @@ async function handleMobileAction(action, payload = {}) {
   }
   if (action === "generate") {
     syncMobileModeFromFiles();
+    state.mobileUI.subroute = "feed";
     await triggerGenerationFromCurrentState();
     return;
   }
@@ -1242,17 +1339,26 @@ async function handleMobileAction(action, payload = {}) {
     return;
   }
   if (action === "copy-prompt") {
-    const item = state.history.find((entry) => entry.id === payload.historyId);
+    const item = state.history.find((entry) => entry.id === payload.historyId) || mobileTransientItemById(payload.transientId);
     if (item?.prompt) {
       const copied = await navigator.clipboard?.writeText(item.prompt).then(() => true).catch(() => false);
       showMobileToast(copied ? "提示词已复制" : "复制失败，请稍后重试");
     }
     return;
   }
-  if (action === "edit-again" && payload.historyId) {
-    const item = state.history.find((entry) => entry.id === payload.historyId);
-    if (!item) return;
-    restoreFromHistory(item);
+  if (action === "edit-again" && (payload.historyId || payload.transientId)) {
+    const historyItem = payload.historyId ? state.history.find((entry) => entry.id === payload.historyId) : null;
+    const transientItem = payload.transientId ? mobileTransientItemById(payload.transientId) : null;
+    if (historyItem) {
+      restoreFromHistory(historyItem);
+    } else if (transientItem?.requestSnapshot) {
+      restoreFromRequestSnapshot(transientItem.requestSnapshot);
+      if (transientItem.requestSnapshot.mode === "edit" && !state.editFiles.length) {
+        state.apiError = "参考图已失效，请重新上传后再试。";
+      }
+    } else {
+      return;
+    }
     state.mobileUI.subroute = "feed";
     state.mobileUI.composerOpen = true;
     state.mobileUI.activeSetting = "";
@@ -1677,13 +1783,20 @@ function extensionFromImageUrl(imageUrl) {
   return match?.[1]?.toLowerCase() || "";
 }
 
-async function pollJob(jobId) {
+async function pollJob(jobId, { transientId = "" } = {}) {
   // 这里故意使用短轮询而不是长连接，便于穿过 Cloudflare 代理超时限制。
   const startedAt = Date.now();
   while (Date.now() - startedAt < pollTimeoutMs) {
     const result = await apiJson(`/api/jobs/${jobId}`);
     state.activeJobStatus = result.status;
     state.activeJobAttempts = result.attemptCount || 0;
+    if (transientId) {
+      patchMobileTransientItem(transientId, {
+        jobId,
+        jobStatus: result.status,
+        attemptCount: result.attemptCount || 0,
+      });
+    }
     render();
 
     if (result.status === "done") return result.result;
@@ -1699,6 +1812,10 @@ async function pollJob(jobId) {
 
 async function generateImage() {
   normalizeCount();
+  const request = currentRequestShape();
+  const useMobileTransient = isMobileAppViewport() && state.route === "app";
+  const transientItem = useMobileTransient ? buildMobileTransientItem(request) : null;
+
   state.isGenerating = true;
   state.selectedId = null;
   state.apiError = "";
@@ -1707,10 +1824,12 @@ async function generateImage() {
   state.activeJobId = null;
   state.activeJobStatus = "queued";
   state.activeJobAttempts = 0;
+  if (transientItem) {
+    upsertMobileTransientItem(transientItem);
+  }
   startGenerationTimer();
   render();
 
-  const request = currentRequestShape();
   try {
     const backendReady = await checkBackendHealth();
     if (!backendReady) {
@@ -1744,19 +1863,36 @@ async function generateImage() {
 
     state.activeJobId = enqueueResult.jobId;
     state.activeJobStatus = enqueueResult.status;
+    if (transientItem) {
+      patchMobileTransientItem(transientItem.id, {
+        jobId: enqueueResult.jobId,
+        jobStatus: enqueueResult.status,
+      });
+    }
     if (state.currentUser && Number.isInteger(enqueueResult.quotaRemaining)) {
       state.currentUser.quotaRemaining = enqueueResult.quotaRemaining;
     }
     render();
 
-    const result = await pollJob(enqueueResult.jobId);
+    const result = await pollJob(enqueueResult.jobId, { transientId: transientItem?.id || "" });
     const nextItem = buildHistoryItem(result, request);
+    if (transientItem) {
+      removeMobileTransientItem(transientItem.id);
+    }
     upsertHistoryItem(nextItem);
     if (state.mode === "edit") {
       clearEditFiles();
     }
   } catch (error) {
     state.apiError = state.showBackendNotice ? "" : error?.message || "图片生成失败，请稍后重试。";
+    if (transientItem) {
+      patchMobileTransientItem(transientItem.id, (item) => ({
+        ...item,
+        status: "failed",
+        jobStatus: state.activeJobStatus || item.jobStatus || "failed",
+        errorMessage: summarizeTransientError(error?.message),
+      }));
+    }
     if (state.apiError.includes("登录")) state.currentUser = null;
     if (state.currentUser) {
       const me = await apiJson("/api/auth/me").catch(() => null);
@@ -1790,6 +1926,7 @@ function startGenerationTimer() {
   generationTimer = window.setInterval(() => {
     if (!state.generationStartedAt) return;
     state.elapsedSeconds = Math.floor((Date.now() - state.generationStartedAt) / 1000);
+    if (state.route === "app" && isMobileAppViewport()) return;
     render();
   }, 1000);
 }
@@ -1824,6 +1961,7 @@ async function logout() {
   state.selectedId = null;
   state.apiError = "";
   clearEditFiles();
+  resetMobileTransientItems();
   state.mobileUI.toast = "";
   state.mobileUI.batchActionText = "";
   state.mobileUI.loginOpen = false;

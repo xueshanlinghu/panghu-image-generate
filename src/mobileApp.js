@@ -22,6 +22,20 @@ function truncatePrompt(prompt, maxLength = 32) {
   return text.length > maxLength ? `${text.slice(0, maxLength)}...` : text;
 }
 
+function transientStatusText(item) {
+  if (item.status === "failed") return "生成失败";
+  if (item.jobStatus === "retrying") return "重试中";
+  if (item.jobStatus === "processing") return "生成中";
+  return "排队中";
+}
+
+function transientHintText(item) {
+  if (item.status === "failed") return item.errorMessage || "本次生成未完成，请调整后重试。";
+  if (item.jobStatus === "retrying") return `正在第 ${Math.max(1, Number(item.attemptCount) || 1)} 次尝试，稍后会继续返回结果`;
+  if (item.jobStatus === "processing") return "图片正在生成，请先继续浏览其他作品";
+  return "任务已提交，正在进入处理队列";
+}
+
 function optionArtwork({ image = "", glyph = "", alt = "" }) {
   return `
     <span class="mobile-option-artwork ${image ? "has-image" : "has-glyph"}">
@@ -145,6 +159,76 @@ function feedCard(item, { selectedId }) {
   `;
 }
 
+function transientReferenceSummary(item) {
+  const count = Number(item?.referencePreview?.count || 0);
+  if (!count) return "";
+  return `已附 ${count} 张参考图`;
+}
+
+function transientFeedCard(item, { formatDateTime }) {
+  const sizePreset = getMobileSizePreset(item.size);
+  const qualityPreset = getMobileQualityPreset(item.quality);
+  const fullPrompt = item.prompt || "未命名作品";
+  const failed = item.status === "failed";
+  const statusText = transientStatusText(item);
+  const hintText = transientHintText(item);
+  const timeText = item.createdAt ? formatDateTime(item.createdAt) : "";
+  const referenceText = transientReferenceSummary(item);
+
+  return `
+    <article class="mobile-feed-card mobile-feed-card-transient mobile-feed-card-${failed ? "failed" : "pending"}">
+      <div class="mobile-feed-head">
+        <strong title="${escapeHtml(fullPrompt)}">${escapeHtml(truncatePrompt(fullPrompt, 44))}</strong>
+        <span class="mobile-feed-subtitle">${escapeHtml([statusText, timeText].filter(Boolean).join(" · "))}</span>
+      </div>
+      <div class="mobile-feed-image mobile-feed-image--${failed ? "failed" : "pending"}" aria-label="${escapeHtml(statusText)}">
+        ${
+          failed
+            ? `
+              <div class="mobile-transient-image-shell">
+                <div class="mobile-transient-failed-mark">!</div>
+                <strong>生成失败</strong>
+                <span>${escapeHtml(item.errorMessage || "请稍后重试")}</span>
+              </div>
+            `
+            : `
+              <div class="mobile-transient-image-shell">
+                ${
+                  item.referencePreview?.url
+                    ? `<img class="mobile-transient-reference" src="${escapeHtml(item.referencePreview.url)}" alt="参考图预览" />`
+                    : ""
+                }
+                <div class="mobile-transient-overlay">
+                  <span class="mobile-transient-kicker">${escapeHtml(statusText)}</span>
+                  <strong>图片生成中</strong>
+                  <span>灵感正在成像，请稍候片刻</span>
+                  <span class="mobile-transient-dots" aria-hidden="true"><i></i><i></i><i></i></span>
+                </div>
+              </div>
+            `
+        }
+      </div>
+      <div class="mobile-feed-actions">
+        ${
+          failed
+            ? `<button class="mobile-pill-button primary" data-mobile-action="edit-again" data-transient-id="${item.id}">沿用参数再试一次</button>`
+            : `
+              <button class="mobile-pill-button" type="button" disabled>沿用参数</button>
+              <button class="mobile-pill-button primary" type="button" disabled>保存到相册</button>
+            `
+        }
+        <div class="mobile-badge-row mobile-feed-meta-row">
+          <span class="mobile-badge">${escapeHtml(badgeText(item.mode))}</span>
+          <span class="mobile-badge">${escapeHtml(sizePreset.badge)}</span>
+          <span class="mobile-badge">${escapeHtml(qualityPreset.badge)}</span>
+          ${referenceText ? `<span class="mobile-badge">${escapeHtml(referenceText)}</span>` : ""}
+        </div>
+        <p class="mobile-feed-hint">${escapeHtml(hintText)}</p>
+      </div>
+    </article>
+  `;
+}
+
 function historyGrid(items, { mobileUI }) {
   return `
     <div class="mobile-history-grid">
@@ -241,7 +325,7 @@ function detailPanel(item, { formatDateTime }) {
 }
 
 function composerPanel({ state, providerOptions, providerLabel, modelOptions, modelLabel, sizeOptions, qualityOptions }) {
-  const open = state.mobileUI.composerOpen || state.isGenerating;
+  const open = state.mobileUI.composerOpen;
   const promptCount = state.prompt.trim().length;
   const currentSize = getMobileSizePreset(state.size);
   const currentQuality = getMobileQualityPreset(state.quality);
@@ -438,6 +522,10 @@ export function renderMobileApp({ state, selectedItem, formatDateTime }) {
   const qualityOptions = getParamOptions(state.providerId, state.model, "quality");
 
   const subroute = state.mobileUI.subroute;
+  const feedItems = [
+    ...state.mobileUI.feedTransientItems.map((item) => transientFeedCard(item, { formatDateTime })),
+    ...state.history.map((item) => feedCard(item, { selectedId: state.selectedId })),
+  ];
   const bodyContent =
     subroute === "history"
       ? `
@@ -477,9 +565,9 @@ export function renderMobileApp({ state, selectedItem, formatDateTime }) {
             ${mobileSavePanel(state.mobileUI.saveItems)}
           `
         : `
-          ${state.history.length ? state.history.map((item) => feedCard(item, { selectedId: state.selectedId })).join("") : ""}
+          ${feedItems.join("")}
           ${
-            state.history.length
+            feedItems.length
               ? ""
               : state.currentUser
                 ? emptyState({ title: "还没有作品", description: "输入提示词后，你的第一张作品会出现在这里。", actionLabel: "开始生成", action: "open-composer" })
@@ -508,12 +596,12 @@ export function renderMobileApp({ state, selectedItem, formatDateTime }) {
                 <button
                   class="mobile-composer-button ${state.currentUser ? "" : "is-login-entry"}"
                   type="button"
-                  data-mobile-action="${state.currentUser ? "open-composer" : "toggle-login"}"
-                  aria-label="${state.currentUser ? "打开生成设置" : "打开登录窗口"}"
+                  data-mobile-action="${state.currentUser ? (state.isGenerating ? "open-feed" : "open-composer") : "toggle-login"}"
+                  aria-label="${state.currentUser ? (state.isGenerating ? "当前正在生成，返回作品流" : "打开生成设置") : "打开登录窗口"}"
                 >
-                  <span class="mobile-composer-kicker">${state.currentUser ? "创作" : "登录"}</span>
-                  <span class="mobile-composer-placeholder">${state.currentUser ? state.prompt.trim() || "描述你想生成的画面" : "登录后开始生成图片"}</span>
-                  <span class="mobile-send-badge"><i data-lucide="${state.currentUser ? "sliders-horizontal" : "user"}"></i></span>
+                  <span class="mobile-composer-kicker">${state.currentUser ? (state.isGenerating ? "进行中" : "创作") : "登录"}</span>
+                  <span class="mobile-composer-placeholder">${state.currentUser ? (state.isGenerating ? "图片生成中，作品会先出现在上方" : state.prompt.trim() || "描述你想生成的画面") : "登录后开始生成图片"}</span>
+                  <span class="mobile-send-badge ${state.isGenerating ? "is-generating" : ""}"><i data-lucide="${state.currentUser ? (state.isGenerating ? "history" : "sliders-horizontal") : "user"}"></i></span>
                 </button>
               </div>
             `
@@ -549,6 +637,7 @@ export function bindMobileAppEvents({ app, onAction, onFieldInput, onLogin }) {
     node.addEventListener("click", () => {
       onAction(node.dataset.mobileAction, {
         historyId: node.dataset.historyId || "",
+        transientId: node.dataset.transientId || "",
         setting: node.dataset.setting || "",
         providerId: node.dataset.providerId || "",
         model: node.dataset.model || "",

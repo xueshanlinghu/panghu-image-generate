@@ -75,9 +75,9 @@ function qualityOption(item, active) {
   `;
 }
 
-function emptyState({ title, description, actionLabel = "", action = "" }) {
+function emptyState({ title, description, actionLabel = "", action = "", className = "" }) {
   return `
-    <section class="mobile-empty-card">
+    <section class="mobile-empty-card ${escapeHtml(className)}">
       <strong>${escapeHtml(title)}</strong>
       <span>${escapeHtml(description)}</span>
       ${
@@ -292,16 +292,22 @@ function mobileToolbar(state) {
         </div>
       </div>
       <div class="mobile-toolbar-actions">
-        <span class="mobile-count-chip">剩余 ${user ? Number(user.quotaRemaining) : 0} 次</span>
+        <span class="mobile-count-chip">${user ? `剩余 ${Number(user.quotaRemaining)} 次` : "未登录"}</span>
         <button class="mobile-icon-button" type="button" data-mobile-action="toggle-theme" aria-label="切换主题">
           <i data-lucide="${theme === "dark" ? "sun" : "moon"}"></i>
         </button>
         <button class="mobile-icon-button" type="button" data-mobile-action="toggle-login" aria-label="${user ? "账号信息" : "登录"}">
           <i data-lucide="user"></i>
         </button>
-        <button class="mobile-icon-button" type="button" data-mobile-action="open-history" aria-label="查看历史作品">
-          <i data-lucide="history"></i>
-        </button>
+        ${
+          user
+            ? `
+              <button class="mobile-icon-button" type="button" data-mobile-action="open-history" aria-label="查看历史作品">
+                <i data-lucide="history"></i>
+              </button>
+            `
+            : ""
+        }
       </div>
     </header>
   `;
@@ -386,7 +392,13 @@ export function renderMobileApp({ state, selectedItem, formatDateTime }) {
               ? ""
               : state.currentUser
                 ? emptyState({ title: "还没有作品", description: "输入提示词后，你的第一张作品会出现在这里。", actionLabel: "开始生成", action: "open-composer" })
-                : emptyState({ title: "登录后即可开始生成图片", description: "登录后可使用你的配额并查看自己的作品记录。", actionLabel: "去登录", action: "toggle-login" })
+                : emptyState({
+                    title: "登录后即可开始生成图片",
+                    description: "登录后可使用你的配额并查看自己的作品记录。",
+                    actionLabel: "去登录",
+                    action: "toggle-login",
+                    className: "mobile-empty-card-emphasis",
+                  })
           }
           ${state.apiError ? `<div class="mobile-inline-error mobile-global-error">${escapeHtml(state.apiError)}</div>` : ""}
         `;
@@ -402,10 +414,15 @@ export function renderMobileApp({ state, selectedItem, formatDateTime }) {
           subroute === "feed"
             ? `
               <div class="mobile-composer-bar">
-                <button class="mobile-composer-button" type="button" data-mobile-action="open-composer" aria-label="打开生成设置">
-                  <span class="mobile-composer-kicker">创作</span>
-                  <span class="mobile-composer-placeholder">${state.prompt.trim() || "描述你想生成的画面"}</span>
-                  <span class="mobile-send-badge"><i data-lucide="sliders-horizontal"></i></span>
+                <button
+                  class="mobile-composer-button ${state.currentUser ? "" : "is-login-entry"}"
+                  type="button"
+                  data-mobile-action="${state.currentUser ? "open-composer" : "toggle-login"}"
+                  aria-label="${state.currentUser ? "打开生成设置" : "打开登录窗口"}"
+                >
+                  <span class="mobile-composer-kicker">${state.currentUser ? "创作" : "登录"}</span>
+                  <span class="mobile-composer-placeholder">${state.currentUser ? state.prompt.trim() || "描述你想生成的画面" : "登录后开始生成图片"}</span>
+                  <span class="mobile-send-badge"><i data-lucide="${state.currentUser ? "sliders-horizontal" : "user"}"></i></span>
                 </button>
               </div>
             `

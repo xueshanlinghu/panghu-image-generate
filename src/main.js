@@ -121,6 +121,12 @@ function showMobileToast(message) {
   }, 2200);
 }
 
+function promptMobileLogin() {
+  state.mobileUI.loginOpen = true;
+  state.loginError = "";
+  render();
+}
+
 function syncMobileModeFromFiles() {
   if (isMobileAppViewport() && state.route === "app") {
     state.mode = state.editFiles.length ? "edit" : "generate";
@@ -1044,6 +1050,25 @@ async function triggerGenerationFromCurrentState() {
 }
 
 async function handleMobileAction(action, payload = {}) {
+  const requiresLoginActions = new Set([
+    "open-history",
+    "open-composer",
+    "select-edit-images",
+    "generate",
+    "download-history",
+    "copy-prompt",
+    "edit-again",
+    "toggle-history-manage",
+    "toggle-history-select",
+    "batch-download",
+    "batch-delete",
+  ]);
+
+  if (!state.currentUser && requiresLoginActions.has(action)) {
+    promptMobileLogin();
+    return;
+  }
+
   if (action === "toggle-theme") {
     toggleTheme();
     render();

@@ -1,6 +1,7 @@
 import {
   BarChart3,
   Check,
+  ChevronLeft,
   ChevronDown,
   createIcons,
   Download,
@@ -23,7 +24,9 @@ import {
   X,
 } from "lucide";
 import "./styles.css";
+import "./mobile.css";
 import { getModelsForProvider, getParamOptions, normalizeModelState } from "./config.js";
+import { bindMobileAppEvents, renderMobileApp } from "./mobileApp.js";
 import { getTheme, toggleTheme } from "./theme.js";
 import { appConfig } from "./appConfig.js";
 
@@ -58,6 +61,16 @@ const state = {
   currentUser: null,
   loginError: "",
   loginLoading: false,
+  mobileUI: {
+    loginOpen: false,
+    composerOpen: false,
+    activeSetting: "",
+    subroute: "feed",
+    managingHistory: false,
+    selectedHistoryIds: [],
+    toast: "",
+    batchActionText: "",
+  },
   admin: {
     ready: false,
     user: null,
@@ -83,12 +96,40 @@ const state = {
 const app = document.querySelector("#app");
 let generationTimer = null;
 let adminRefreshTimer = null;
+let mobileToastTimer = null;
 const mobileQuery = window.matchMedia("(max-width: 768px)");
 state.leftCollapsed = mobileQuery.matches;
+
+function isMobileAppViewport() {
+  return mobileQuery.matches;
+}
+
+function resetMobileHistorySelection() {
+  state.mobileUI.managingHistory = false;
+  state.mobileUI.selectedHistoryIds = [];
+  state.mobileUI.batchActionText = "";
+}
+
+function showMobileToast(message) {
+  state.mobileUI.toast = message;
+  if (mobileToastTimer) window.clearTimeout(mobileToastTimer);
+  render();
+  mobileToastTimer = window.setTimeout(() => {
+    state.mobileUI.toast = "";
+    render();
+  }, 2200);
+}
+
+function syncMobileModeFromFiles() {
+  if (isMobileAppViewport() && state.route === "app") {
+    state.mode = state.editFiles.length ? "edit" : "generate";
+  }
+}
 
 const icons = {
   BarChart3,
   Check,
+  ChevronLeft,
   ChevronDown,
   Download,
   History,
@@ -239,6 +280,7 @@ function normalizeCount() {
 }
 
 function currentRequestShape() {
+  syncMobileModeFromFiles();
   normalizeCount();
   return {
     providerId: state.providerId,
@@ -391,6 +433,10 @@ function promptMetaText() {
 }
 
 function render() {
+  const mobileAppActive = state.route === "app" && isMobileAppViewport();
+  document.body.classList.toggle("is-mobile-app", mobileAppActive);
+  app.classList.toggle("is-mobile-app", mobileAppActive);
+
   if (state.route === "login") {
     renderLogin();
     return;
@@ -399,11 +445,27 @@ function render() {
     renderAdmin();
     return;
   }
+  if (mobileAppActive) {
+    renderMobileRoot();
+    return;
+  }
   renderApp();
 }
 
 function applyIcons() {
   createIcons({ icons });
+}
+
+function renderMobileRoot() {
+  normalizeModelState(state);
+  syncMobileModeFromFiles();
+  app.innerHTML = renderMobileApp({
+    state,
+    selectedItem: selectedItem(),
+    formatDateTime,
+  });
+  bindMobileEvents();
+  applyIcons();
 }
 
 function renderApp() {
@@ -878,33 +940,14 @@ function bindAppEvents() {
 
   app.querySelector("[data-role='prompt-form']").addEventListener("submit", async (event) => {
     event.preventDefault();
-    if (!state.currentUser) {
-      state.apiError = "请先登录后再生成图片。";
-      render();
-      return;
-    }
-    if (state.currentUser.quotaRemaining <= 0) {
-      state.apiError = "可用生图次数不足，请联系管理员增加次数。";
-      render();
-      return;
-    }
-
     const textarea = app.querySelector("[data-field='prompt']");
     state.prompt = textarea.value.trim();
     if (!state.prompt || state.prompt.length > maxPromptLength) {
       textarea.focus();
       textarea.classList.add("is-invalid");
-      state.apiError = `提示词长度需在 1 到 ${maxPromptLength} 个字符之间。`;
       window.setTimeout(() => textarea.classList.remove("is-invalid"), 900);
-      render();
-      return;
     }
-    if (state.mode === "edit" && !state.editFiles.length) {
-      state.apiError = "请至少上传一张参考图。";
-      render();
-      return;
-    }
-    await generateImage();
+    await triggerGenerationFromCurrentState();
   });
 
   app.querySelectorAll("[data-action]").forEach((button) => {
@@ -912,29 +955,262 @@ function bindAppEvents() {
   });
 }
 
+function bindMobileEvents() {
+  bindMobileAppEvents({
+    app,
+    onAction: (action, payload) => {
+      void handleMobileAction(action, payload);
+    },
+    onFieldInput: (field, value) => {
+      if (field === "prompt") {
+        state.prompt = value;
+      }
+    },
+    onLogin: (formData) => {
+      void submitUserLogin(formData);
+    },
+  });
+
+  const editInput = app.querySelector("[data-role='edit-file-input']");
+  if (editInput) {
+    editInput.addEventListener("change", (event) => {
+      appendEditFiles(event.currentTarget.files);
+      syncMobileModeFromFiles();
+      event.currentTarget.value = "";
+      render();
+    });
+  }
+}
+
+async function submitUserLogin(formData) {
+  state.loginLoading = true;
+  state.loginError = "";
+  render();
+  try {
+    const result = await apiJson("/api/auth/login", {
+      method: "POST",
+      body: JSON.stringify({ username: formData.get("username"), password: formData.get("password") }),
+    });
+    state.currentUser = result.user;
+    state.history = [];
+    state.selectedId = null;
+    state.mobileUI.loginOpen = false;
+    await loadStoredHistory();
+    if (state.route === "login") {
+      routeTo("/");
+      return;
+    }
+  } catch (error) {
+    state.loginError = error.message;
+  } finally {
+    state.loginLoading = false;
+    render();
+  }
+}
+
+async function triggerGenerationFromCurrentState() {
+  if (!state.currentUser) {
+    state.apiError = "请先登录后再生成图片。";
+    if (isMobileAppViewport()) state.mobileUI.loginOpen = true;
+    render();
+    return;
+  }
+  if (state.currentUser.quotaRemaining <= 0) {
+    state.apiError = "可用生图次数不足，请联系管理员增加次数。";
+    render();
+    return;
+  }
+
+  state.prompt = state.prompt.trim();
+  if (!state.prompt || state.prompt.length > maxPromptLength) {
+    state.apiError = `提示词长度需在 1 到 ${maxPromptLength} 个字符之间。`;
+    render();
+    return;
+  }
+
+  syncMobileModeFromFiles();
+  if (state.mode === "edit" && !state.editFiles.length) {
+    state.apiError = "请至少上传一张参考图。";
+    render();
+    return;
+  }
+
+  state.mobileUI.composerOpen = false;
+  state.mobileUI.activeSetting = "";
+  state.mobileUI.subroute = "feed";
+  await generateImage();
+}
+
+async function handleMobileAction(action, payload = {}) {
+  if (action === "toggle-theme") {
+    toggleTheme();
+    render();
+    return;
+  }
+  if (action === "toggle-login") {
+    state.mobileUI.loginOpen = !state.mobileUI.loginOpen;
+    state.loginError = "";
+    render();
+    return;
+  }
+  if (action === "logout") {
+    state.mobileUI.loginOpen = false;
+    await logout();
+    return;
+  }
+  if (action === "open-history") {
+    state.mobileUI.subroute = "history";
+    resetMobileHistorySelection();
+    render();
+    return;
+  }
+  if (action === "open-feed") {
+    state.mobileUI.subroute = "feed";
+    resetMobileHistorySelection();
+    render();
+    return;
+  }
+  if (action === "detail-back") {
+    state.mobileUI.subroute = "history";
+    render();
+    return;
+  }
+  if (action === "open-detail") {
+    state.selectedId = payload.historyId || state.selectedId;
+    state.mobileUI.subroute = "detail";
+    render();
+    return;
+  }
+  if (action === "open-composer") {
+    state.mobileUI.composerOpen = true;
+    state.mobileUI.activeSetting = "";
+    render();
+    return;
+  }
+  if (action === "close-composer") {
+    state.mobileUI.composerOpen = false;
+    state.mobileUI.activeSetting = "";
+    render();
+    return;
+  }
+  if (action === "toggle-setting") {
+    state.mobileUI.activeSetting = state.mobileUI.activeSetting === payload.setting ? "" : payload.setting;
+    render();
+    return;
+  }
+  if (action === "set-size" && payload.size) {
+    state.size = payload.size;
+    render();
+    return;
+  }
+  if (action === "set-quality" && payload.quality) {
+    state.quality = payload.quality;
+    render();
+    return;
+  }
+  if (action === "select-edit-images") {
+    app.querySelector("[data-role='edit-file-input']")?.click();
+    return;
+  }
+  if (action === "remove-reference" && payload.fileId) {
+    removeEditFile(payload.fileId);
+    syncMobileModeFromFiles();
+    render();
+    return;
+  }
+  if (action === "generate") {
+    syncMobileModeFromFiles();
+    await triggerGenerationFromCurrentState();
+    return;
+  }
+  if (action === "download-history" && payload.historyId) {
+    await downloadHistoryItemById(payload.historyId).catch((error) => {
+      state.apiError = error?.message || "原图下载失败，请稍后重试。";
+      render();
+    });
+    return;
+  }
+  if (action === "copy-prompt") {
+    const item = state.history.find((entry) => entry.id === payload.historyId);
+    if (item?.prompt) {
+      const copied = await navigator.clipboard?.writeText(item.prompt).then(() => true).catch(() => false);
+      showMobileToast(copied ? "提示词已复制" : "复制失败，请稍后重试");
+    }
+    return;
+  }
+  if (action === "edit-again" && payload.historyId) {
+    const item = state.history.find((entry) => entry.id === payload.historyId);
+    if (!item) return;
+    restoreFromHistory(item);
+    state.mobileUI.subroute = "feed";
+    state.mobileUI.composerOpen = true;
+    state.mobileUI.activeSetting = "";
+    render();
+    return;
+  }
+  if (action === "toggle-history-manage") {
+    if (state.mobileUI.batchActionText) return;
+    state.mobileUI.managingHistory = !state.mobileUI.managingHistory;
+    state.mobileUI.selectedHistoryIds = [];
+    render();
+    return;
+  }
+  if (action === "toggle-history-select" && payload.historyId) {
+    if (state.mobileUI.selectedHistoryIds.includes(payload.historyId)) {
+      state.mobileUI.selectedHistoryIds = state.mobileUI.selectedHistoryIds.filter((id) => id !== payload.historyId);
+    } else {
+      state.mobileUI.selectedHistoryIds = [...state.mobileUI.selectedHistoryIds, payload.historyId];
+    }
+    render();
+    return;
+  }
+  if (action === "batch-download") {
+    if (!state.mobileUI.selectedHistoryIds.length || state.mobileUI.batchActionText) return;
+    let successCount = 0;
+    let failedCount = 0;
+    state.mobileUI.batchActionText = `正在下载 ${state.mobileUI.selectedHistoryIds.length} 张作品`;
+    render();
+    for (const historyId of state.mobileUI.selectedHistoryIds) {
+      // 顺序下载可以减少浏览器一次性弹出多个下载的失败概率。
+      // eslint-disable-next-line no-await-in-loop
+      await downloadHistoryItemById(historyId)
+        .then(() => {
+          successCount += 1;
+        })
+        .catch(() => {
+          failedCount += 1;
+        });
+    }
+    state.mobileUI.batchActionText = "";
+    state.apiError = failedCount ? `${failedCount} 张作品下载失败，请稍后重试。` : "";
+    render();
+    showMobileToast(successCount ? `已处理 ${successCount} 张作品下载` : "没有可下载的作品");
+    return;
+  }
+  if (action === "batch-delete") {
+    if (!state.mobileUI.selectedHistoryIds.length || state.mobileUI.batchActionText) return;
+    const confirmed = window.confirm(`确定删除已选择的 ${state.mobileUI.selectedHistoryIds.length} 张历史图片吗？`);
+    if (!confirmed) return;
+    let removedCount = 0;
+    state.mobileUI.batchActionText = `正在删除 ${state.mobileUI.selectedHistoryIds.length} 张作品`;
+    render();
+    for (const historyId of [...state.mobileUI.selectedHistoryIds]) {
+      // eslint-disable-next-line no-await-in-loop
+      const removed = await removeHistoryItem(historyId, { skipConfirm: true, skipRender: true });
+      if (removed) removedCount += 1;
+    }
+    state.mobileUI.selectedHistoryIds = [];
+    state.mobileUI.managingHistory = false;
+    state.mobileUI.batchActionText = "";
+    render();
+    showMobileToast(removedCount ? `已删除 ${removedCount} 张作品` : "没有删除任何作品");
+  }
+}
+
 function bindLoginEvents() {
   app.querySelector("[data-role='login-form']").addEventListener("submit", async (event) => {
     event.preventDefault();
-    const form = new FormData(event.currentTarget);
-    state.loginLoading = true;
-    state.loginError = "";
-    render();
-    try {
-      const result = await apiJson("/api/auth/login", {
-        method: "POST",
-        body: JSON.stringify({ username: form.get("username"), password: form.get("password") }),
-      });
-      state.currentUser = result.user;
-      state.history = [];
-      state.selectedId = null;
-      await loadStoredHistory();
-      routeTo("/");
-    } catch (error) {
-      state.loginError = error.message;
-    } finally {
-      state.loginLoading = false;
-      render();
-    }
+    await submitUserLogin(new FormData(event.currentTarget));
   });
   app.querySelectorAll("[data-action]").forEach((button) => button.addEventListener("click", () => handleSharedAction(button.dataset.action)));
 }
@@ -1094,8 +1370,18 @@ function openFullscreen(src, alt = "") {
 
 async function downloadSelectedImage() {
   const item = selectedItem();
-  if (!item?.downloadUrl) return;
+  if (!item) return;
+  await downloadHistoryItem(item);
+}
 
+async function downloadHistoryItemById(historyId) {
+  const item = state.history.find((entry) => entry.id === historyId);
+  if (!item) return;
+  await downloadHistoryItem(item);
+}
+
+async function downloadHistoryItem(item) {
+  if (!item?.downloadUrl) return;
   const safeTime = formatShanghaiTimestamp(item.createdAt);
   const response = await fetch(item.downloadUrl, { credentials: "same-origin" });
   if (!response.ok) {
@@ -1291,25 +1577,45 @@ async function logout() {
   state.selectedId = null;
   state.apiError = "";
   clearEditFiles();
+  state.mobileUI.toast = "";
+  state.mobileUI.batchActionText = "";
+  state.mobileUI.loginOpen = false;
+  state.mobileUI.composerOpen = false;
+  state.mobileUI.activeSetting = "";
+  state.mobileUI.subroute = "feed";
+  resetMobileHistorySelection();
   render();
 }
 
 async function deleteHistoryItem(historyId) {
+  await removeHistoryItem(historyId);
+}
+
+async function removeHistoryItem(historyId, { skipConfirm = false, skipRender = false } = {}) {
   const item = state.history.find((entry) => entry.id === historyId);
-  if (!item) return;
-  const confirmed = window.confirm("确定删除这张历史图片吗？\n\n删除后会同时移除服务器上的本地缓存图片。");
-  if (!confirmed) return;
+  if (!item) return false;
+  if (!skipConfirm) {
+    const confirmed = window.confirm("确定删除这张历史图片吗？\n\n删除后会同时移除服务器上的本地缓存图片。");
+    if (!confirmed) return false;
+  }
   try {
     await apiJson(`/api/images/history/${historyId}`, { method: "DELETE" });
     state.history = state.history.filter((entry) => entry.id !== historyId);
     if (state.selectedId === historyId) {
       state.selectedId = state.history[0]?.id ?? null;
     }
+    state.mobileUI.selectedHistoryIds = state.mobileUI.selectedHistoryIds.filter((id) => id !== historyId);
     state.apiError = "";
   } catch (error) {
     state.apiError = error.message;
+    if (!skipRender) render();
+    return false;
   }
-  render();
+  if (!state.history.length) {
+    state.mobileUI.subroute = "feed";
+  }
+  if (!skipRender) render();
+  return true;
 }
 
 async function loadSession() {

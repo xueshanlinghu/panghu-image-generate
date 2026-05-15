@@ -464,6 +464,23 @@ function applyIcons() {
   createIcons({ icons });
 }
 
+function updateMobilePromptUI() {
+  const countNode = app.querySelector("[data-role='mobile-prompt-count']");
+  if (countNode) {
+    countNode.textContent = `${state.prompt.trim().length}/${maxPromptLength}`;
+  }
+
+  const sendButton = app.querySelector("[data-role='mobile-send-button']");
+  if (sendButton) {
+    const promptCount = state.prompt.trim().length;
+    const sendDisabled = !promptCount || state.isGenerating;
+    const sendTitle = state.isGenerating ? "生成中" : promptCount ? "生成图片" : "请输入提示词";
+    sendButton.disabled = sendDisabled;
+    sendButton.setAttribute("aria-label", sendTitle);
+    sendButton.setAttribute("title", sendTitle);
+  }
+}
+
 function renderMobileRoot() {
   normalizeModelState(state);
   syncMobileModeFromFiles();
@@ -972,6 +989,7 @@ function bindMobileEvents() {
     onFieldInput: (field, value) => {
       if (field === "prompt") {
         state.prompt = value;
+        updateMobilePromptUI();
       }
     },
     onLogin: (formData) => {
@@ -1125,13 +1143,29 @@ async function handleMobileAction(action, payload = {}) {
     render();
     return;
   }
+  if (action === "set-provider" && payload.providerId) {
+    state.providerId = payload.providerId;
+    normalizeModelState(state);
+    state.mobileUI.activeSetting = "";
+    render();
+    return;
+  }
+  if (action === "set-model" && payload.model) {
+    state.model = payload.model;
+    normalizeModelState(state);
+    state.mobileUI.activeSetting = "";
+    render();
+    return;
+  }
   if (action === "set-size" && payload.size) {
     state.size = payload.size;
+    state.mobileUI.activeSetting = "";
     render();
     return;
   }
   if (action === "set-quality" && payload.quality) {
     state.quality = payload.quality;
+    state.mobileUI.activeSetting = "";
     render();
     return;
   }

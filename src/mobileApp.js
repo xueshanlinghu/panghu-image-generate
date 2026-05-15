@@ -1,4 +1,5 @@
-import { getParamOptions, getProvider } from "./config.js";
+import { appConfig } from "./appConfig.js";
+import { getModelsForProvider, getParamOptions, getProvider } from "./config.js";
 import { getTheme } from "./theme.js";
 import { getMobileModelIcon, getMobileProviderIcon, getMobileQualityPreset, getMobileSizePreset } from "./mobileIcons.js";
 
@@ -21,58 +22,86 @@ function truncatePrompt(prompt, maxLength = 32) {
   return text.length > maxLength ? `${text.slice(0, maxLength)}...` : text;
 }
 
-function staticMetaCard({ label, value, icon }) {
+function optionArtwork({ image = "", glyph = "", alt = "" }) {
   return `
-    <article class="mobile-static-meta">
-      <img class="mobile-static-meta-icon" src="${escapeHtml(icon)}" alt="" />
-      <div class="mobile-static-meta-copy">
-        <span>${escapeHtml(label)}</span>
-        <strong>${escapeHtml(value)}</strong>
-      </div>
-    </article>
+    <span class="mobile-option-artwork ${image ? "has-image" : "has-glyph"}">
+      ${image ? `<img class="mobile-option-artwork-image" src="${escapeHtml(image)}" alt="${escapeHtml(alt)}" />` : `<span class="mobile-option-artwork-glyph">${escapeHtml(glyph)}</span>`}
+    </span>
   `;
 }
 
-function settingTile({ active, action, setting, icon, label, value }) {
+function settingTile({ active, setting, label, image = "", glyph = "" }) {
   return `
-    <button class="mobile-tool-tile ${active ? "active" : ""}" type="button" data-mobile-action="${escapeHtml(action)}" data-setting="${escapeHtml(setting)}">
-      ${
-        icon
-          ? `<img class="mobile-tool-icon" src="${escapeHtml(icon)}" alt="" />`
-          : `<span class="mobile-tool-badge">${escapeHtml(value)}</span>`
-      }
-      <div class="mobile-tool-copy">
-        <strong>${escapeHtml(label)}</strong>
-        <span>${escapeHtml(value)}</span>
-      </div>
+    <button class="mobile-setting-tile ${active ? "active" : ""}" type="button" data-mobile-action="toggle-setting" data-setting="${escapeHtml(setting)}" aria-label="${escapeHtml(label)}" title="${escapeHtml(label)}">
+      ${optionArtwork({ image, glyph, alt: label })}
     </button>
   `;
+}
+
+function settingOptionCard({ active, action, valueKey, value, label, detail, image = "", glyph = "" }) {
+  return `
+    <button
+      class="mobile-setting-option-card ${active ? "active" : ""}"
+      type="button"
+      data-mobile-action="${escapeHtml(action)}"
+      data-${escapeHtml(valueKey)}="${escapeHtml(value)}"
+      aria-label="${escapeHtml(`${label} ${detail}`.trim())}"
+      title="${escapeHtml(`${label} ${detail}`.trim())}"
+    >
+      ${optionArtwork({ image, glyph, alt: label })}
+    </button>
+  `;
+}
+
+function providerOption(item, active) {
+  return settingOptionCard({
+    active,
+    action: "set-provider",
+    valueKey: "provider-id",
+    value: item.id,
+    label: item.name,
+    detail: item.badge || item.name,
+    image: getMobileProviderIcon(item.id),
+  });
+}
+
+function modelOption(item, active) {
+  return settingOptionCard({
+    active,
+    action: "set-model",
+    valueKey: "model",
+    value: item.id,
+    label: item.name,
+    detail: item.id,
+    image: getMobileModelIcon(item.id),
+  });
 }
 
 function sizeOption(item, active) {
   const preset = getMobileSizePreset(item.id);
-  return `
-    <button class="mobile-setting-option mobile-setting-option-rich ${active ? "active" : ""}" type="button" data-mobile-action="set-size" data-size="${item.id}">
-      <img class="mobile-setting-option-icon" src="${escapeHtml(preset.icon)}" alt="" />
-      <span class="mobile-setting-option-copy">
-        <strong>${escapeHtml(preset.title)}</strong>
-        <em>${escapeHtml(preset.detail || item.name)}</em>
-      </span>
-    </button>
-  `;
+  return settingOptionCard({
+    active,
+    action: "set-size",
+    valueKey: "size",
+    value: item.id,
+    label: preset.title,
+    detail: preset.detail || item.name,
+    image: preset.cardImage || preset.icon,
+  });
 }
 
 function qualityOption(item, active) {
   const preset = getMobileQualityPreset(item.id);
-  return `
-    <button class="mobile-setting-option mobile-setting-option-rich ${active ? "active" : ""}" type="button" data-mobile-action="set-quality" data-quality="${item.id}">
-      <span class="mobile-setting-option-glyph">${escapeHtml(preset.badge)}</span>
-      <span class="mobile-setting-option-copy">
-        <strong>${escapeHtml(preset.title)}</strong>
-        <em>${escapeHtml(preset.detail)}</em>
-      </span>
-    </button>
-  `;
+  return settingOptionCard({
+    active,
+    action: "set-quality",
+    valueKey: "quality",
+    value: item.id,
+    label: preset.title,
+    detail: preset.detail,
+    image: preset.cardImage || "",
+    glyph: preset.glyph || preset.badge,
+  });
 }
 
 function emptyState({ title, description, actionLabel = "", action = "", className = "" }) {
@@ -172,32 +201,19 @@ function detailPanel(item, { formatDateTime }) {
   `;
 }
 
-function composerPanel({ state, providerLabel, modelLabel, sizeOptions, qualityOptions }) {
+function composerPanel({ state, providerOptions, providerLabel, modelOptions, modelLabel, sizeOptions, qualityOptions }) {
   const open = state.mobileUI.composerOpen || state.isGenerating;
   const promptCount = state.prompt.trim().length;
   const currentSize = getMobileSizePreset(state.size);
   const currentQuality = getMobileQualityPreset(state.quality);
+  const sendDisabled = !promptCount || state.isGenerating;
+  const sendTitle = state.isGenerating ? "生成中" : promptCount ? "生成图片" : "请输入提示词";
 
   return `
     <div class="mobile-layer ${open ? "active" : ""}">
       <div class="mobile-backdrop ${open ? "active" : ""}" data-mobile-action="close-composer"></div>
       <section class="mobile-composer-sheet ${open ? "active" : ""}">
         <button class="mobile-sheet-handle" type="button" data-mobile-action="close-composer" aria-label="收起生成设置"></button>
-
-        <div class="mobile-sheet-head">
-          <div class="mobile-sheet-heading">
-            <strong>生成设置</strong>
-            <span>${state.editFiles.length ? "已添加参考图，将按图生图处理" : "未添加参考图时按文生图生成"}</span>
-          </div>
-          <button class="mobile-icon-button" type="button" data-mobile-action="close-composer" aria-label="关闭生成设置">
-            <i data-lucide="x"></i>
-          </button>
-        </div>
-
-        <div class="mobile-static-meta-grid">
-          ${staticMetaCard({ label: "提供商", value: providerLabel, icon: getMobileProviderIcon(state.providerId) })}
-          ${staticMetaCard({ label: "模型", value: modelLabel, icon: getMobileModelIcon(state.model) })}
-        </div>
 
         <div class="mobile-sheet-block">
           <div class="mobile-title-row">
@@ -222,28 +238,60 @@ function composerPanel({ state, providerLabel, modelLabel, sizeOptions, qualityO
         <div class="mobile-sheet-block">
           <div class="mobile-title-row">
             <strong>提示词</strong>
-            <span>${promptCount}/32000</span>
+            <span data-role="mobile-prompt-count">${promptCount}/32000</span>
           </div>
           <textarea class="mobile-textarea" data-mobile-field="prompt" placeholder="描述你想生成的画面">${escapeHtml(state.prompt)}</textarea>
         </div>
 
         <div class="mobile-tool-row">
           ${settingTile({
+            active: state.mobileUI.activeSetting === "provider",
+            setting: "provider",
+            label: "提供商",
+            image: getMobileProviderIcon(state.providerId),
+          })}
+          ${settingTile({
+            active: state.mobileUI.activeSetting === "model",
+            setting: "model",
+            label: "模型",
+            image: getMobileModelIcon(state.model),
+          })}
+          ${settingTile({
             active: state.mobileUI.activeSetting === "size",
-            action: "toggle-setting",
             setting: "size",
-            icon: currentSize.icon,
             label: "尺寸",
-            value: currentSize.badge,
+            image: currentSize.cardImage || currentSize.icon,
           })}
           ${settingTile({
             active: state.mobileUI.activeSetting === "quality",
-            action: "toggle-setting",
             setting: "quality",
-            icon: "",
             label: "清晰度",
-            value: currentQuality.badge,
+            image: currentQuality.cardImage || "",
+            glyph: currentQuality.glyph || currentQuality.badge,
           })}
+          <button class="mobile-send-tile" type="button" data-role="mobile-send-button" data-mobile-action="generate" ${sendDisabled ? "disabled" : ""} aria-label="${escapeHtml(sendTitle)}" title="${escapeHtml(sendTitle)}">
+            <i data-lucide="send"></i>
+          </button>
+        </div>
+
+        <div class="mobile-setting-panel ${state.mobileUI.activeSetting === "provider" ? "active" : ""}">
+          <div class="mobile-title-row">
+            <strong>提供商</strong>
+            <span>选择当前生图服务</span>
+          </div>
+          <div class="mobile-setting-card-grid">
+            ${providerOptions.map((item) => providerOption(item, state.providerId === item.id)).join("")}
+          </div>
+        </div>
+
+        <div class="mobile-setting-panel ${state.mobileUI.activeSetting === "model" ? "active" : ""}">
+          <div class="mobile-title-row">
+            <strong>模型</strong>
+            <span>选择本次使用的模型</span>
+          </div>
+          <div class="mobile-setting-card-grid">
+            ${modelOptions.map((item) => modelOption(item, state.model === item.id)).join("")}
+          </div>
         </div>
 
         <div class="mobile-setting-panel ${state.mobileUI.activeSetting === "size" ? "active" : ""}">
@@ -251,7 +299,7 @@ function composerPanel({ state, providerLabel, modelLabel, sizeOptions, qualityO
             <strong>图片尺寸</strong>
             <span>选择更适合当前画面的比例</span>
           </div>
-          <div class="mobile-setting-list">
+          <div class="mobile-setting-card-grid">
             ${sizeOptions.map((item) => sizeOption(item, state.size === item.id)).join("")}
           </div>
         </div>
@@ -261,17 +309,9 @@ function composerPanel({ state, providerLabel, modelLabel, sizeOptions, qualityO
             <strong>图片清晰度</strong>
             <span>更高质量通常会更慢</span>
           </div>
-          <div class="mobile-setting-list">
+          <div class="mobile-setting-card-grid">
             ${qualityOptions.map((item) => qualityOption(item, state.quality === item.id)).join("")}
           </div>
-        </div>
-
-        <div class="mobile-generate-row">
-          ${
-            promptCount
-              ? `<button class="mobile-generate-button" type="button" data-mobile-action="generate" ${state.isGenerating ? "disabled" : ""}>${state.isGenerating ? "生成中" : "开始生成"}</button>`
-              : ""
-          }
         </div>
       </section>
     </div>
@@ -352,6 +392,9 @@ function mobileLoginSheet(state) {
 
 export function renderMobileApp({ state, selectedItem, formatDateTime }) {
   const providerLabel = getProvider(state.providerId)?.name || "胖狐 API";
+  const providerOptions = appConfig.providers;
+  const modelOptions = getModelsForProvider(state.providerId);
+  const modelLabel = modelOptions.find((item) => item.id === state.model)?.name || state.model;
   const sizeOptions = getParamOptions(state.providerId, state.model, "size");
   const qualityOptions = getParamOptions(state.providerId, state.model, "quality");
 
@@ -429,7 +472,7 @@ export function renderMobileApp({ state, selectedItem, formatDateTime }) {
             : ""
         }
         <input class="hidden-file-input" data-role="edit-file-input" type="file" accept="image/png,image/jpeg,image/webp" multiple />
-        ${composerPanel({ state, providerLabel, modelLabel: state.model, sizeOptions, qualityOptions })}
+        ${composerPanel({ state, providerOptions, providerLabel, modelOptions, modelLabel, sizeOptions, qualityOptions })}
         ${mobileLoginSheet(state)}
         ${
           subroute === "history" && state.mobileUI.managingHistory
@@ -463,6 +506,8 @@ export function bindMobileAppEvents({ app, onAction, onFieldInput, onLogin }) {
       onAction(node.dataset.mobileAction, {
         historyId: node.dataset.historyId || "",
         setting: node.dataset.setting || "",
+        providerId: node.dataset.providerId || "",
+        model: node.dataset.model || "",
         size: node.dataset.size || "",
         quality: node.dataset.quality || "",
         fileId: node.dataset.fileId || "",
@@ -472,7 +517,10 @@ export function bindMobileAppEvents({ app, onAction, onFieldInput, onLogin }) {
 
   app.querySelectorAll("[data-mobile-field]").forEach((field) => {
     field.addEventListener("input", (event) => {
-      onFieldInput(event.currentTarget.dataset.mobileField, event.currentTarget.value);
+      onFieldInput(event.currentTarget.dataset.mobileField, event.currentTarget.value, {
+        selectionStart: typeof event.currentTarget.selectionStart === "number" ? event.currentTarget.selectionStart : null,
+        selectionEnd: typeof event.currentTarget.selectionEnd === "number" ? event.currentTarget.selectionEnd : null,
+      });
     });
   });
 

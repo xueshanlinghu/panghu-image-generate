@@ -73,6 +73,7 @@ body.is-mobile-app {
   flex-wrap: wrap;
   justify-content: space-between;
   align-items: center;
+  padding: 0 4px 2px;
 }
 
 .mobile-feed-meta-row {
@@ -217,6 +218,12 @@ body.is-mobile-app {
   box-shadow: var(--mobile-shadow);
 }
 
+.mobile-feed-card {
+  background: transparent;
+  border: 0;
+  box-shadow: none;
+}
+
 .mobile-feed-card,
 .mobile-detail-card,
 .mobile-empty-card {
@@ -252,6 +259,7 @@ body.is-mobile-app {
 
 .mobile-feed-head {
   gap: 4px;
+  padding: 0 4px;
 }
 
 .mobile-feed-image,
@@ -260,7 +268,7 @@ body.is-mobile-app {
   display: block;
   width: 100%;
   overflow: hidden;
-  border-radius: 16px;
+  border-radius: 20px;
   background: var(--mobile-surface);
   border: 1px solid var(--mobile-line);
 }
@@ -268,6 +276,9 @@ body.is-mobile-app {
 .mobile-feed-image {
   aspect-ratio: 4 / 3;
   min-height: 184px;
+  border: 0;
+  background: transparent;
+  box-shadow: 0 12px 28px rgba(19, 36, 28, 0.08);
 }
 
 .mobile-feed-image img,
@@ -322,17 +333,18 @@ body.is-mobile-app {
 .mobile-history-grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 2px;
-  overflow: hidden;
-  border-radius: 18px;
-  background: var(--mobile-line);
+  gap: 8px;
+  background: transparent;
 }
 
 .mobile-history-tile {
   aspect-ratio: 1 / 1;
   position: relative;
-  border-radius: 0;
+  overflow: hidden;
+  border-radius: 18px;
   border: 0;
+  background: transparent;
+  box-shadow: 0 8px 22px rgba(19, 36, 28, 0.07);
 }
 
 .mobile-history-check {
@@ -710,18 +722,20 @@ body.is-mobile-app {
 
 .mobile-manage-bar {
   position: absolute;
-  left: 0;
-  right: 0;
-  bottom: 0;
+  left: 12px;
+  right: 12px;
+  bottom: calc(10px + var(--mobile-safe-bottom));
   z-index: 16;
   display: grid;
   grid-template-columns: 1fr auto auto;
   align-items: center;
   gap: 12px;
-  min-height: calc(74px + var(--mobile-safe-bottom));
-  padding: 10px 16px calc(10px + var(--mobile-safe-bottom));
-  background: var(--mobile-panel);
-  border-top: 1px solid var(--mobile-line);
+  min-height: 68px;
+  padding: 12px 14px;
+  background: color-mix(in srgb, var(--mobile-panel) 90%, transparent);
+  border-radius: 22px;
+  box-shadow: 0 12px 30px rgba(19, 36, 28, 0.12);
+  backdrop-filter: blur(10px);
 }
 
 .mobile-manage-bar button {
@@ -732,11 +746,12 @@ body.is-mobile-app {
   gap: 4px;
   padding: 6px 0;
   border-radius: 14px;
-  border: 1px solid var(--mobile-line);
+  border: 0;
   background: var(--mobile-surface);
   color: var(--mobile-text);
   font-size: 11px;
   font-weight: 700;
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--mobile-line) 72%, transparent);
 }
 
 .mobile-manage-bar button:disabled {

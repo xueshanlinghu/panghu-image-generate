@@ -297,7 +297,7 @@ function mobileToolbar(state) {
           <i data-lucide="${theme === "dark" ? "sun" : "moon"}"></i>
         </button>
         <button class="mobile-icon-button" type="button" data-mobile-action="toggle-login" aria-label="${user ? "账号信息" : "登录"}">
-          <i data-lucide="user-plus"></i>
+          <i data-lucide="user"></i>
         </button>
         <button class="mobile-icon-button" type="button" data-mobile-action="open-history" aria-label="查看历史作品">
           <i data-lucide="history"></i>

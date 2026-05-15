@@ -209,7 +209,9 @@ body.is-mobile-app {
 .mobile-detail-card,
 .mobile-empty-card,
 .mobile-login-sheet,
-.mobile-composer-sheet {
+.mobile-composer-sheet,
+.mobile-save-panel,
+.mobile-save-card {
   background: var(--mobile-panel);
   border: 1px solid var(--mobile-line);
   border-radius: var(--mobile-radius-xl);
@@ -224,7 +226,9 @@ body.is-mobile-app {
 
 .mobile-feed-card,
 .mobile-detail-card,
-.mobile-empty-card {
+.mobile-empty-card,
+.mobile-save-panel,
+.mobile-save-card {
   display: grid;
   gap: 8px;
   padding: 12px;
@@ -238,7 +242,9 @@ body.is-mobile-app {
 .mobile-setting-panel,
 .mobile-login-form,
 .mobile-setting-card-grid,
-.mobile-manage-copy {
+.mobile-manage-copy,
+.mobile-save-copy,
+.mobile-save-list {
   display: grid;
   gap: 8px;
 }
@@ -260,7 +266,8 @@ body.is-mobile-app {
 
 .mobile-feed-image,
 .mobile-detail-image,
-.mobile-history-tile {
+.mobile-history-tile,
+.mobile-save-image {
   display: block;
   width: 100%;
   overflow: hidden;
@@ -280,6 +287,7 @@ body.is-mobile-app {
 .mobile-feed-image img,
 .mobile-detail-image img,
 .mobile-history-tile img,
+.mobile-save-image img,
 .mobile-reference-item img {
   display: block;
   width: 100%;
@@ -299,6 +307,25 @@ body.is-mobile-app {
 
 .mobile-detail-image {
   aspect-ratio: 1 / 1;
+}
+
+.mobile-save-image {
+  aspect-ratio: 1 / 1;
+}
+
+.mobile-save-image img {
+  object-fit: contain;
+  background: var(--mobile-surface);
+}
+
+.mobile-save-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.mobile-save-actions .mobile-pill-button {
+  text-decoration: none;
 }
 
 .mobile-pill-button.primary,
@@ -587,7 +614,7 @@ body.is-mobile-app {
 
 .mobile-setting-tile {
   min-height: 66px;
-  padding: 6px;
+  padding: 2px;
 }
 
 .mobile-setting-tile.active,
@@ -600,7 +627,7 @@ body.is-mobile-app {
 .mobile-option-artwork {
   display: grid;
   width: 100%;
-  max-width: 52px;
+  height: 100%;
   aspect-ratio: 1 / 1;
   place-items: center;
   overflow: hidden;
@@ -648,7 +675,7 @@ body.is-mobile-app {
 
 .mobile-setting-option-card {
   min-height: 82px;
-  padding: 6px;
+  padding: 2px;
 }
 
 .mobile-setting-tile.active .mobile-option-artwork,
